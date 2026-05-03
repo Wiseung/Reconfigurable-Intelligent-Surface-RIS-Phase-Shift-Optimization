@@ -1,0 +1,1 @@
+define((()=>{return e={474:e=>{window.requirejs&&window.requirejs.config({map:{"*":{"jupyter-threejs":"nbextensions/jupyter-threejs/index",three:"nbextensions/jupyter-threejs/three"}}}),e.exports={load_ipython_extension:function(){}}}},r={},function t(n){var o=r[n];if(void 0!==o)return o.exports;var i=r[n]={exports:{}};return e[n](i,i.exports,t),i.exports}(474);var e,r}));

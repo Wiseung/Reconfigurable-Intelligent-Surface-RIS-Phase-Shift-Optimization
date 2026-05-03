@@ -1,0 +1,511 @@
+"""PyTorch SAC agent for grouped RIS phase-shift optimization.
+
+Design choices driven by the project constraints:
+
+1. The physical RIS has 100x100 elements, but the policy operates on a grouped
+   10x10 control grid to keep optimization tractable on a 24 GB GPU.
+2. Replay data is stored strictly as CPU-side NumPy arrays. Only sampled mini
+   batches are transferred to the target device.
+3. State tensors can contain very small channel coefficients. A LayerNorm is
+   therefore applied at the input of both actor and critics.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from typing import Any
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import Normal
+
+
+LOG_STD_MIN = -20.0
+LOG_STD_MAX = 2.0
+EPS = 1e-6
+
+
+@dataclass(slots=True)
+class SACConfig:
+    """Configuration for the grouped RIS SAC agent."""
+
+    state_dim: int
+    grouped_rows: int = 10
+    grouped_cols: int = 10
+    physical_rows: int = 100
+    physical_cols: int = 100
+    hidden_dim: int = 512
+    gamma: float = 0.99
+    tau: float = 0.005
+    actor_lr: float = 3e-4
+    critic_lr: float = 3e-4
+    alpha_lr: float = 3e-4
+    init_alpha: float = 0.2
+    batch_size: int = 128
+    replay_capacity: int = 20000
+    target_entropy: float | None = None
+    device: str | None = None
+
+    @property
+    def grouped_action_dim(self) -> int:
+        return self.grouped_rows * self.grouped_cols
+
+    @property
+    def physical_action_dim(self) -> int:
+        return self.physical_rows * self.physical_cols
+
+
+class ReplayBuffer:
+    """CPU-only replay buffer backed by NumPy arrays."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        capacity: int,
+        dtype: np.dtype = np.float32,
+    ) -> None:
+        self.state_dim = int(state_dim)
+        self.action_dim = int(action_dim)
+        self.capacity = int(capacity)
+        self.dtype = dtype
+
+        self.states = np.empty((self.capacity, self.state_dim), dtype=self.dtype)
+        self.actions = np.empty((self.capacity, self.action_dim), dtype=self.dtype)
+        self.rewards = np.empty((self.capacity, 1), dtype=self.dtype)
+        self.next_states = np.empty((self.capacity, self.state_dim), dtype=self.dtype)
+        self.dones = np.empty((self.capacity, 1), dtype=self.dtype)
+
+        self.ptr = 0
+        self.size = 0
+
+    def add(
+        self,
+        state: np.ndarray,
+        action: np.ndarray,
+        reward: float,
+        next_state: np.ndarray,
+        done: bool,
+    ) -> None:
+        """Store one transition strictly on CPU."""
+        state = np.asarray(state, dtype=self.dtype).reshape(-1)
+        action = np.asarray(action, dtype=self.dtype).reshape(-1)
+        next_state = np.asarray(next_state, dtype=self.dtype).reshape(-1)
+
+        if state.size != self.state_dim:
+            raise ValueError(
+                f"Expected state_dim={self.state_dim}, but received {state.size}."
+            )
+        if action.size != self.action_dim:
+            raise ValueError(
+                f"Expected action_dim={self.action_dim}, but received {action.size}."
+            )
+        if next_state.size != self.state_dim:
+            raise ValueError(
+                f"Expected next_state_dim={self.state_dim}, but received {next_state.size}."
+            )
+
+        self.states[self.ptr] = state
+        self.actions[self.ptr] = action
+        self.rewards[self.ptr, 0] = float(reward)
+        self.next_states[self.ptr] = next_state
+        self.dones[self.ptr, 0] = float(done)
+
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample(self, batch_size: int, device: torch.device | str) -> dict[str, torch.Tensor]:
+        """Move only the sampled mini-batch to the target device."""
+        if self.size < batch_size:
+            raise ValueError(
+                f"Not enough samples in buffer: size={self.size}, batch_size={batch_size}."
+            )
+
+        indices = np.random.randint(0, self.size, size=batch_size)
+        batch = {
+            "states": torch.from_numpy(self.states[indices]),
+            "actions": torch.from_numpy(self.actions[indices]),
+            "rewards": torch.from_numpy(self.rewards[indices]),
+            "next_states": torch.from_numpy(self.next_states[indices]),
+            "dones": torch.from_numpy(self.dones[indices]),
+        }
+        return {key: value.to(device) for key, value in batch.items()}
+
+    def __len__(self) -> int:
+        return self.size
+
+
+class GroupedRISMapper:
+    """Map grouped 10x10 policy actions back to the physical 100x100 RIS."""
+
+    def __init__(
+        self,
+        grouped_rows: int = 10,
+        grouped_cols: int = 10,
+        physical_rows: int = 100,
+        physical_cols: int = 100,
+        phase_scale: float = float(np.pi),
+    ) -> None:
+        if physical_rows % grouped_rows != 0 or physical_cols % grouped_cols != 0:
+            raise ValueError(
+                "Physical RIS dimensions must be divisible by grouped dimensions."
+            )
+
+        self.grouped_rows = int(grouped_rows)
+        self.grouped_cols = int(grouped_cols)
+        self.physical_rows = int(physical_rows)
+        self.physical_cols = int(physical_cols)
+        self.phase_scale = float(phase_scale)
+        self.tile_rows = self.physical_rows // self.grouped_rows
+        self.tile_cols = self.physical_cols // self.grouped_cols
+        self.grouped_action_dim = self.grouped_rows * self.grouped_cols
+        self.physical_action_dim = self.physical_rows * self.physical_cols
+
+    def grouped_to_phase_matrix(
+        self,
+        grouped_action: np.ndarray | torch.Tensor,
+    ) -> np.ndarray | torch.Tensor:
+        """Convert grouped actions in [-1, 1] to a tiled phase matrix in [-pi, pi]."""
+        if isinstance(grouped_action, torch.Tensor):
+            return self._grouped_to_phase_matrix_torch(grouped_action)
+        return self._grouped_to_phase_matrix_numpy(grouped_action)
+
+    def grouped_to_env_action(
+        self,
+        grouped_action: np.ndarray | torch.Tensor,
+    ) -> np.ndarray | torch.Tensor:
+        """Flatten the tiled physical phase matrix for env.step(action)."""
+        phase_matrix = self.grouped_to_phase_matrix(grouped_action)
+        return phase_matrix.reshape(*phase_matrix.shape[:-2], -1)
+
+    def _grouped_to_phase_matrix_numpy(self, grouped_action: np.ndarray) -> np.ndarray:
+        grouped_action = np.asarray(grouped_action, dtype=np.float32)
+        if grouped_action.shape[-1] != self.grouped_action_dim:
+            raise ValueError(
+                f"Expected grouped action dim {self.grouped_action_dim}, "
+                f"received {grouped_action.shape[-1]}."
+            )
+
+        grouped_grid = grouped_action.reshape(
+            *grouped_action.shape[:-1], self.grouped_rows, self.grouped_cols
+        )
+        phase_grid = grouped_grid * self.phase_scale
+        phase_grid = np.repeat(phase_grid, self.tile_rows, axis=-2)
+        phase_grid = np.repeat(phase_grid, self.tile_cols, axis=-1)
+        return phase_grid.astype(np.float32)
+
+    def _grouped_to_phase_matrix_torch(self, grouped_action: torch.Tensor) -> torch.Tensor:
+        if grouped_action.shape[-1] != self.grouped_action_dim:
+            raise ValueError(
+                f"Expected grouped action dim {self.grouped_action_dim}, "
+                f"received {grouped_action.shape[-1]}."
+            )
+
+        grouped_grid = grouped_action.reshape(
+            *grouped_action.shape[:-1], self.grouped_rows, self.grouped_cols
+        )
+        phase_grid = grouped_grid * self.phase_scale
+        phase_grid = torch.repeat_interleave(phase_grid, self.tile_rows, dim=-2)
+        phase_grid = torch.repeat_interleave(phase_grid, self.tile_cols, dim=-1)
+        return phase_grid
+
+
+class GaussianActor(nn.Module):
+    """SAC actor with LayerNorm on the state input."""
+
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 512) -> None:
+        super().__init__()
+        self.state_norm = nn.LayerNorm(state_dim)
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.mean_head = nn.Linear(hidden_dim, action_dim)
+        self.log_std_head = nn.Linear(hidden_dim, action_dim)
+
+    def forward(self, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x = self.state_norm(state)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        mean = self.mean_head(x)
+        log_std = self.log_std_head(x).clamp(LOG_STD_MIN, LOG_STD_MAX)
+        return mean, log_std
+
+    def sample(
+        self,
+        state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mean, log_std = self(state)
+        std = log_std.exp()
+        normal = Normal(mean, std)
+        raw_action = normal.rsample()
+        squashed_action = torch.tanh(raw_action)
+
+        log_prob = normal.log_prob(raw_action)
+        log_prob = log_prob - torch.log(1.0 - squashed_action.pow(2) + EPS)
+        log_prob = log_prob.sum(dim=-1, keepdim=True)
+
+        deterministic_action = torch.tanh(mean)
+        return squashed_action, log_prob, deterministic_action
+
+
+class QNetwork(nn.Module):
+    """Single critic network with LayerNorm on the state branch."""
+
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 512) -> None:
+        super().__init__()
+        self.state_norm = nn.LayerNorm(state_dim)
+        self.fc1 = nn.Linear(state_dim + action_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, 1)
+
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        normalized_state = self.state_norm(state)
+        x = torch.cat([normalized_state, action], dim=-1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+
+class TwinCritic(nn.Module):
+    """Twin critics used by SAC."""
+
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 512) -> None:
+        super().__init__()
+        self.q1 = QNetwork(state_dim, action_dim, hidden_dim)
+        self.q2 = QNetwork(state_dim, action_dim, hidden_dim)
+
+    def forward(
+        self,
+        state: torch.Tensor,
+        action: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.q1(state, action), self.q2(state, action)
+
+
+class SACAgent:
+    """Soft Actor-Critic agent for grouped RIS control."""
+
+    def __init__(self, config: SACConfig) -> None:
+        self.config = config
+        self.device = torch.device(
+            config.device
+            if config.device is not None
+            else ("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        self.mapper = GroupedRISMapper(
+            grouped_rows=config.grouped_rows,
+            grouped_cols=config.grouped_cols,
+            physical_rows=config.physical_rows,
+            physical_cols=config.physical_cols,
+        )
+
+        self.actor = GaussianActor(
+            state_dim=config.state_dim,
+            action_dim=config.grouped_action_dim,
+            hidden_dim=config.hidden_dim,
+        ).to(self.device)
+        self.critic = TwinCritic(
+            state_dim=config.state_dim,
+            action_dim=config.grouped_action_dim,
+            hidden_dim=config.hidden_dim,
+        ).to(self.device)
+        self.critic_target = TwinCritic(
+            state_dim=config.state_dim,
+            action_dim=config.grouped_action_dim,
+            hidden_dim=config.hidden_dim,
+        ).to(self.device)
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        for parameter in self.critic_target.parameters():
+            parameter.requires_grad = False
+
+        self.actor_optimizer = torch.optim.Adam(
+            self.actor.parameters(),
+            lr=config.actor_lr,
+        )
+        self.critic_optimizer = torch.optim.Adam(
+            self.critic.parameters(),
+            lr=config.critic_lr,
+        )
+
+        init_log_alpha = np.log(config.init_alpha)
+        self.log_alpha = torch.tensor(
+            [init_log_alpha],
+            dtype=torch.float32,
+            device=self.device,
+            requires_grad=True,
+        )
+        self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=config.alpha_lr)
+        self.target_entropy = (
+            float(config.target_entropy)
+            if config.target_entropy is not None
+            else -float(config.grouped_action_dim)
+        )
+
+        self.replay_buffer = ReplayBuffer(
+            state_dim=config.state_dim,
+            action_dim=config.grouped_action_dim,
+            capacity=config.replay_capacity,
+        )
+
+    @property
+    def alpha(self) -> torch.Tensor:
+        return self.log_alpha.exp()
+
+    def select_action(
+        self,
+        state: np.ndarray,
+        deterministic: bool = False,
+        return_grouped_action: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray] | np.ndarray:
+        """Return the flattened physical action and optionally the grouped action."""
+        grouped_action = self.sample_grouped_action(
+            state,
+            deterministic=deterministic,
+        )
+        env_action = (
+            self.mapper.grouped_to_env_action(grouped_action)
+            .reshape(-1)
+            .astype(np.float32)
+        )
+
+        if return_grouped_action:
+            return env_action, grouped_action
+        return env_action
+
+    def sample_grouped_action_tensor(
+        self,
+        state_tensor: torch.Tensor,
+        deterministic: bool = False,
+    ) -> torch.Tensor:
+        """Sample a grouped action tensor on the agent device."""
+        if state_tensor.ndim == 1:
+            state_tensor = state_tensor.unsqueeze(0)
+        state_tensor = state_tensor.to(self.device)
+        self.actor.eval()
+        with torch.no_grad():
+            sampled_action, _, deterministic_action = self.actor.sample(state_tensor)
+            action = deterministic_action if deterministic else sampled_action
+        self.actor.train()
+        return action.squeeze(0)
+
+    def sample_grouped_action(
+        self,
+        state: np.ndarray,
+        deterministic: bool = False,
+    ) -> np.ndarray:
+        """Sample a 100-D grouped action in [-1, 1]."""
+        state_tensor = torch.from_numpy(np.asarray(state, dtype=np.float32)).unsqueeze(0)
+        action = self.sample_grouped_action_tensor(
+            state_tensor,
+            deterministic=deterministic,
+        )
+        return action.cpu().numpy().astype(np.float32)
+
+    def expand_grouped_action(
+        self,
+        grouped_action: np.ndarray | torch.Tensor,
+    ) -> np.ndarray | torch.Tensor:
+        """Expand a grouped 100-D action into a physical 100x100 phase matrix."""
+        return self.mapper.grouped_to_phase_matrix(grouped_action)
+
+    def store_transition(
+        self,
+        state: np.ndarray,
+        grouped_action: np.ndarray,
+        reward: float,
+        next_state: np.ndarray,
+        done: bool,
+    ) -> None:
+        """Store grouped actions only, never the expanded 10000-D physical action."""
+        self.replay_buffer.add(state, grouped_action, reward, next_state, done)
+
+    def ready(self) -> bool:
+        return len(self.replay_buffer) >= self.config.batch_size
+
+    def update(self) -> dict[str, float]:
+        """Perform one SAC update step from a CPU-resident replay buffer."""
+        if not self.ready():
+            raise ValueError(
+                f"Replay buffer has {len(self.replay_buffer)} samples, "
+                f"need at least {self.config.batch_size}."
+            )
+
+        batch = self.replay_buffer.sample(self.config.batch_size, self.device)
+        states = batch["states"]
+        actions = batch["actions"]
+        rewards = batch["rewards"]
+        next_states = batch["next_states"]
+        dones = batch["dones"]
+
+        with torch.no_grad():
+            next_actions, next_log_prob, _ = self.actor.sample(next_states)
+            target_q1, target_q2 = self.critic_target(next_states, next_actions)
+            target_q = torch.min(target_q1, target_q2) - self.alpha.detach() * next_log_prob
+            target_value = rewards + (1.0 - dones) * self.config.gamma * target_q
+
+        current_q1, current_q2 = self.critic(states, actions)
+        critic_loss = F.mse_loss(current_q1, target_value) + F.mse_loss(current_q2, target_value)
+
+        self.critic_optimizer.zero_grad(set_to_none=True)
+        critic_loss.backward()
+        self.critic_optimizer.step()
+
+        new_actions, log_prob, _ = self.actor.sample(states)
+        q1_pi, q2_pi = self.critic(states, new_actions)
+        min_q_pi = torch.min(q1_pi, q2_pi)
+        actor_loss = (self.alpha.detach() * log_prob - min_q_pi).mean()
+
+        self.actor_optimizer.zero_grad(set_to_none=True)
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
+
+        self.alpha_optimizer.zero_grad(set_to_none=True)
+        alpha_loss.backward()
+        self.alpha_optimizer.step()
+
+        self._soft_update_target_network()
+
+        return {
+            "critic_loss": float(critic_loss.detach().cpu().item()),
+            "actor_loss": float(actor_loss.detach().cpu().item()),
+            "alpha_loss": float(alpha_loss.detach().cpu().item()),
+            "alpha": float(self.alpha.detach().cpu().item()),
+            "mean_q": float(min_q_pi.detach().mean().cpu().item()),
+            "mean_log_prob": float(log_prob.detach().mean().cpu().item()),
+        }
+
+    def save(self, path: str) -> None:
+        """Save the trainable SAC state."""
+        payload = {
+            "config": asdict(self.config),
+            "actor": self.actor.state_dict(),
+            "critic": self.critic.state_dict(),
+            "critic_target": self.critic_target.state_dict(),
+            "actor_optimizer": self.actor_optimizer.state_dict(),
+            "critic_optimizer": self.critic_optimizer.state_dict(),
+            "log_alpha": self.log_alpha.detach().cpu(),
+            "alpha_optimizer": self.alpha_optimizer.state_dict(),
+        }
+        torch.save(payload, path)
+
+    def load(self, path: str, strict: bool = True) -> None:
+        """Load a saved SAC state."""
+        payload: dict[str, Any] = torch.load(path, map_location=self.device)
+        self.actor.load_state_dict(payload["actor"], strict=strict)
+        self.critic.load_state_dict(payload["critic"], strict=strict)
+        self.critic_target.load_state_dict(payload["critic_target"], strict=strict)
+        self.actor_optimizer.load_state_dict(payload["actor_optimizer"])
+        self.critic_optimizer.load_state_dict(payload["critic_optimizer"])
+        self.log_alpha.data.copy_(payload["log_alpha"].to(self.device))
+        self.alpha_optimizer.load_state_dict(payload["alpha_optimizer"])
+
+    def _soft_update_target_network(self) -> None:
+        for target_param, param in zip(
+            self.critic_target.parameters(),
+            self.critic.parameters(),
+        ):
+            target_param.data.mul_(1.0 - self.config.tau)
+            target_param.data.add_(self.config.tau * param.data)

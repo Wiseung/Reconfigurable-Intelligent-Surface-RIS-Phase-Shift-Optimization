@@ -1,0 +1,47 @@
+seed: 7
+
+env:
+  carrier_frequency_hz: 3500000000.0
+  bandwidth_hz: 10000000.0
+  tx_power_dbm: 30.0
+  noise_temperature_k: 290.0
+  rx_height_m: 1.5
+  rx_jitter_xy_m: 2.0
+  blind_spot_search_center: [0.0, 0.0, 1.5]
+  blind_spot_search_size: [400.0, 400.0]
+  blind_spot_cell_size: [8.0, 8.0]
+  num_blind_spot_candidates: 16
+  require_native_ris: true
+
+agent:
+  grouped_rows: 10
+  grouped_cols: 10
+  physical_rows: 100
+  physical_cols: 100
+  hidden_dim: 512
+  gamma: 0.99
+  tau: 0.005
+  actor_lr: 0.0003
+  critic_lr: 0.0003
+  alpha_lr: 0.0003
+  init_alpha: 0.2
+  batch_size: 128
+  replay_capacity: 20000
+  target_entropy:
+  device:
+
+train:
+  num_episodes: 100
+  max_steps_per_episode: 20
+  warmup_steps: 1024
+  updates_per_step: 1
+  checkpoint_every: 10
+  deterministic_eval: false
+
+logging:
+  output_dir: runs
+  experiment_name: sac_ris
+  log_file: training.log
+  metrics_file: metrics.jsonl
+  csv_file: episode_metrics.csv
+  save_final_checkpoint: true
