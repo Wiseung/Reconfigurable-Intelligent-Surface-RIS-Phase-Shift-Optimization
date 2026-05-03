@@ -54,7 +54,13 @@ def plot_coverage_comparison(
 
     max_depth = int(max_depth if max_depth is not None else getattr(env, "max_depth", 3))
     num_samples = int(
-        num_samples if num_samples is not None else getattr(env, "num_samples", int(1e6))
+        num_samples
+        if num_samples is not None
+        else getattr(
+            env,
+            "coverage_num_samples",
+            getattr(env, "num_samples", int(1e5)),
+        )
     )
     if cm_center is None:
         rx_height = float(getattr(env, "rx_height_m", 1.5))
@@ -175,20 +181,46 @@ def plot_learning_curve(
     *,
     smoothing_window: int = 10,
     baseline_key: str = "phase_gradient_reflector_rate",
+    primary_key: str = "avg_reward",
+    include_shaped: bool = True,
+    include_eval: bool = True,
     figure_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Plot a smoothed reward curve and compare it with the reflector baseline."""
+    """Plot raw, shaped, and eval reward curves against the reflector baseline."""
     metrics_path, csv_path = _resolve_training_artifacts(run_path)
     baseline_metrics, episode_metrics = _load_training_metrics(metrics_path, csv_path)
 
+    valid_primary_keys = {
+        "avg_reward",
+        "avg_shaped_reward",
+        "eval_avg_reward",
+        "eval_avg_shaped_reward",
+    }
+    if primary_key not in valid_primary_keys:
+        raise ValueError(f"`primary_key` must be one of {sorted(valid_primary_keys)}.")
+
     episodes = np.asarray([row["episode"] for row in episode_metrics], dtype=np.int32)
     rewards = np.asarray([row["avg_reward"] for row in episode_metrics], dtype=np.float64)
-    if rewards.size == 0:
-        raise RuntimeError("No episode rewards were found in the training artifacts.")
+    primary_values = np.asarray(
+        [_maybe_float(row.get(primary_key)) for row in episode_metrics],
+        dtype=np.float64,
+    )
+    if rewards.size == 0 or not np.isfinite(primary_values).any():
+        raise RuntimeError("No valid reward metrics were found in the training artifacts.")
 
-    window = max(1, min(int(smoothing_window), rewards.size))
-    smoothed_rewards = _moving_average(rewards, window=window)
-    baseline = baseline_metrics.get(baseline_key)
+    window = max(1, min(int(smoothing_window), primary_values.size))
+    smoothed_primary = _moving_average(primary_values, window=window)
+
+    episode_baselines = np.asarray(
+        [_maybe_float(row.get("episode_reward_baseline")) for row in episode_metrics],
+        dtype=np.float64,
+    )
+    finite_episode_baselines = episode_baselines[np.isfinite(episode_baselines)]
+    baseline = (
+        float(np.mean(finite_episode_baselines))
+        if finite_episode_baselines.size > 0
+        else baseline_metrics.get(baseline_key)
+    )
 
     fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
     sns.lineplot(
@@ -202,15 +234,44 @@ def plot_learning_curve(
     )
     sns.lineplot(
         x=episodes,
-        y=smoothed_rewards,
+        y=smoothed_primary,
         ax=ax,
-        label=f"Smoothed reward (window={window})",
+        label=f"Smoothed {primary_key} (window={window})",
         color="#1d4ed8",
         linewidth=2.5,
     )
 
+    shaped_rewards = np.asarray(
+        [_maybe_float(row.get("avg_shaped_reward")) for row in episode_metrics],
+        dtype=np.float64,
+    )
+    if include_shaped and np.isfinite(shaped_rewards).any():
+        sns.lineplot(
+            x=episodes,
+            y=_moving_average(shaped_rewards, window=window),
+            ax=ax,
+            label="Smoothed shaped reward",
+            color="#ea580c",
+            linewidth=2.2,
+        )
+
+    eval_rewards = np.asarray(
+        [_maybe_float(row.get("eval_avg_reward")) for row in episode_metrics],
+        dtype=np.float64,
+    )
+    if include_eval and np.isfinite(eval_rewards).any():
+        sns.lineplot(
+            x=episodes,
+            y=eval_rewards,
+            ax=ax,
+            label="Deterministic eval reward",
+            color="#059669",
+            linewidth=2.0,
+            linestyle="--",
+        )
+
     improvement_percent = None
-    best_smoothed_reward = float(np.max(smoothed_rewards))
+    best_smoothed_reward = float(np.nanmax(smoothed_primary))
     if baseline is not None:
         ax.axhline(
             float(baseline),
@@ -237,7 +298,7 @@ def plot_learning_curve(
 
     ax.set_title("RIS DRL Training Reward Curve")
     ax.set_xlabel("Episode")
-    ax.set_ylabel("Average reward [bit/s/Hz]")
+    ax.set_ylabel("Average rate / reward [bit/s/Hz]")
     ax.legend(loc="best")
     sns.despine(fig=fig)
 
@@ -249,7 +310,7 @@ def plot_learning_curve(
         "ax": ax,
         "episodes": episodes,
         "rewards": rewards,
-        "smoothed_rewards": smoothed_rewards,
+        "smoothed_rewards": smoothed_primary,
         "baseline": baseline,
         "best_smoothed_reward": best_smoothed_reward,
         "improvement_percent": improvement_percent,
@@ -552,7 +613,7 @@ def _load_training_metrics(
         "no_ris_rate": None,
         "phase_gradient_reflector_rate": None,
     }
-    episode_metrics: list[dict[str, float]] = []
+    episode_metrics: list[dict[str, Any]] = []
 
     if metrics_path is not None and metrics_path.exists():
         with metrics_path.open("r", encoding="utf-8") as handle:
@@ -571,6 +632,24 @@ def _load_training_metrics(
                         {
                             "episode": int(payload["episode"]),
                             "avg_reward": float(payload["avg_reward"]),
+                            "avg_shaped_reward": _maybe_float(payload.get("avg_shaped_reward")),
+                            "avg_reward_margin": _maybe_float(payload.get("avg_reward_margin")),
+                            "eval_avg_reward": _maybe_float(payload.get("eval_avg_reward")),
+                            "eval_avg_shaped_reward": _maybe_float(
+                                payload.get("eval_avg_shaped_reward")
+                            ),
+                            "eval_avg_reward_margin": _maybe_float(
+                                payload.get("eval_avg_reward_margin")
+                            ),
+                            "episode_reward_baseline": _maybe_float(
+                                payload.get("episode_reward_baseline")
+                            ),
+                            "episode_no_ris_rate": _maybe_float(
+                                payload.get("episode_no_ris_rate")
+                            ),
+                            "episode_phase_gradient_reflector_rate": _maybe_float(
+                                payload.get("episode_phase_gradient_reflector_rate")
+                            ),
                         }
                     )
 
@@ -582,6 +661,22 @@ def _load_training_metrics(
                     {
                         "episode": int(float(row["episode"])),
                         "avg_reward": float(row["avg_reward"]),
+                        "avg_shaped_reward": _maybe_float(row.get("avg_shaped_reward")),
+                        "avg_reward_margin": _maybe_float(row.get("avg_reward_margin")),
+                        "eval_avg_reward": _maybe_float(row.get("eval_avg_reward")),
+                        "eval_avg_shaped_reward": _maybe_float(
+                            row.get("eval_avg_shaped_reward")
+                        ),
+                        "eval_avg_reward_margin": _maybe_float(
+                            row.get("eval_avg_reward_margin")
+                        ),
+                        "episode_reward_baseline": _maybe_float(
+                            row.get("episode_reward_baseline")
+                        ),
+                        "episode_no_ris_rate": _maybe_float(row.get("episode_no_ris_rate")),
+                        "episode_phase_gradient_reflector_rate": _maybe_float(
+                            row.get("episode_phase_gradient_reflector_rate")
+                        ),
                     }
                 )
 
@@ -590,6 +685,15 @@ def _load_training_metrics(
 
 
 def _moving_average(values: np.ndarray, window: int) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    finite_mask = np.isfinite(values)
+    if not np.all(finite_mask):
+        smoothed = np.full(values.shape, np.nan, dtype=np.float64)
+        finite_values = values[finite_mask]
+        if finite_values.size == 0:
+            return smoothed
+        smoothed[finite_mask] = _moving_average(finite_values, window)
+        return smoothed
     if window <= 1:
         return values.astype(np.float64, copy=True)
     kernel = np.ones(window, dtype=np.float64) / float(window)
@@ -610,6 +714,11 @@ def _set_sparse_heatmap_ticks(ax: Any, shape: tuple[int, int]) -> None:
 def _maybe_float(value: Any) -> float | None:
     if value is None:
         return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped == "" or stripped.lower() in {"none", "null", "nan"}:
+            return None
+        return float(stripped)
     return float(value)
 
 

@@ -1,0 +1,82 @@
+seed: 7
+env:
+  carrier_frequency_hz: 3500000000.0
+  bandwidth_hz: 10000000.0
+  tx_power_dbm: 30.0
+  noise_temperature_k: 290.0
+  tf_device: cpu
+  tf_memory_limit_mb: 14336
+  max_depth: 2
+  path_num_samples: 5000
+  coverage_num_samples: 20000
+  probe_num_samples: 64
+  state_num_paths: 64
+  rx_height_m: 1.5
+  rx_jitter_xy_m: 1.0
+  blind_spot_search_center:
+  - -10.0
+  - 90.0
+  - 1.5
+  blind_spot_search_size:
+  - 80.0
+  - 80.0
+  blind_spot_cell_size:
+  - 8.0
+  - 8.0
+  num_blind_spot_candidates: 8
+  require_native_ris: true
+  tx_boresight_target:
+  - 0.0
+  - 90.0
+  - 1.5
+  ris_position:
+  - -180.0
+  - 100.0
+  - 20.0
+agent:
+  grouped_rows: 10
+  grouped_cols: 10
+  physical_rows: 100
+  physical_cols: 100
+  hidden_dim: 512
+  gamma: 0.99
+  tau: 0.005
+  actor_lr: 0.0003
+  critic_lr: 0.0003
+  alpha_lr: 0.0003
+  init_alpha: 0.05
+  batch_size: 64
+  replay_capacity: 10000
+  target_entropy: null
+  target_entropy_scale: 0.2
+  alpha_min: 0.01
+  alpha_max: 0.08
+  device: null
+train:
+  num_episodes: 4
+  max_steps_per_episode: 8
+  warmup_steps: 64
+  warmup_action_scale: 0.18
+  policy_exploration_scale_start: 0.2
+  policy_exploration_scale_end: 0.05
+  policy_additive_noise_std_start: 0.01
+  policy_additive_noise_std_end: 0.0
+  policy_noise_decay_steps: 256
+  collection_deterministic_prob_start: 0.0
+  collection_deterministic_prob_end: 0.75
+  collection_deterministic_prob_decay_steps: 256
+  collection_deterministic_noise_std: 0.0
+  updates_per_step: 1
+  checkpoint_every: 0
+  deterministic_eval: true
+  eval_every_episodes: 4
+  eval_num_episodes: 2
+  reward_margin_weight: 0.3
+  reward_baseline_key: phase_gradient_reflector_rate
+logging:
+  output_dir: runs
+  experiment_name: sac_ris_smoke_tight_sac
+  log_file: training.log
+  metrics_file: metrics.jsonl
+  csv_file: episode_metrics.csv
+  save_final_checkpoint: true

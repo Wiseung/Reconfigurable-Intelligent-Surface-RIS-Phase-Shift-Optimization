@@ -5,12 +5,21 @@ env:
   bandwidth_hz: 10000000.0
   tx_power_dbm: 30.0
   noise_temperature_k: 290.0
+  tx_boresight_target: [0.0, 90.0, 1.5]
+  tf_device: cpu
+  tf_memory_limit_mb: 14336
+  max_depth: 2
+  path_num_samples: 6000
+  coverage_num_samples: 30000
+  probe_num_samples: 64
+  state_num_paths: 64
   rx_height_m: 1.5
-  rx_jitter_xy_m: 2.0
-  blind_spot_search_center: [0.0, 0.0, 1.5]
-  blind_spot_search_size: [400.0, 400.0]
+  rx_jitter_xy_m: 1.0
+  blind_spot_search_center: [-10.0, 90.0, 1.5]
+  blind_spot_search_size: [80.0, 80.0]
   blind_spot_cell_size: [8.0, 8.0]
-  num_blind_spot_candidates: 16
+  num_blind_spot_candidates: 8
+  ris_position: [-180.0, 100.0, 20.0]
   require_native_ris: true
 
 agent:
@@ -31,16 +40,16 @@ agent:
   device:
 
 train:
-  num_episodes: 100
-  max_steps_per_episode: 20
-  warmup_steps: 1024
+  num_episodes: 30
+  max_steps_per_episode: 10
+  warmup_steps: 256
   updates_per_step: 1
-  checkpoint_every: 10
+  checkpoint_every: 5
   deterministic_eval: false
 
 logging:
   output_dir: runs
-  experiment_name: sac_ris
+  experiment_name: sac_ris_cpu
   log_file: training.log
   metrics_file: metrics.jsonl
   csv_file: episode_metrics.csv

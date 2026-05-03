@@ -45,7 +45,14 @@ class SACConfig:
     init_alpha: float = 0.2
     batch_size: int = 128
     replay_capacity: int = 20000
+    prioritized_replay: bool = False
+    replay_priority_alpha: float = 1.0
+    replay_uniform_ratio: float = 0.0
+    replay_priority_epsilon: float = 1e-3
     target_entropy: float | None = None
+    target_entropy_scale: float | None = 1.0
+    alpha_min: float | None = None
+    alpha_max: float | None = None
     device: str | None = None
 
     @property
@@ -66,17 +73,26 @@ class ReplayBuffer:
         action_dim: int,
         capacity: int,
         dtype: np.dtype = np.float32,
+        prioritized: bool = False,
+        priority_alpha: float = 1.0,
+        uniform_ratio: float = 0.0,
+        priority_epsilon: float = 1e-3,
     ) -> None:
         self.state_dim = int(state_dim)
         self.action_dim = int(action_dim)
         self.capacity = int(capacity)
         self.dtype = dtype
+        self.prioritized = bool(prioritized)
+        self.priority_alpha = float(priority_alpha)
+        self.uniform_ratio = float(np.clip(uniform_ratio, 0.0, 1.0))
+        self.priority_epsilon = float(max(priority_epsilon, 1e-8))
 
         self.states = np.empty((self.capacity, self.state_dim), dtype=self.dtype)
         self.actions = np.empty((self.capacity, self.action_dim), dtype=self.dtype)
         self.rewards = np.empty((self.capacity, 1), dtype=self.dtype)
         self.next_states = np.empty((self.capacity, self.state_dim), dtype=self.dtype)
         self.dones = np.empty((self.capacity, 1), dtype=self.dtype)
+        self.priorities = np.ones((self.capacity,), dtype=np.float32)
 
         self.ptr = 0
         self.size = 0
@@ -88,7 +104,8 @@ class ReplayBuffer:
         reward: float,
         next_state: np.ndarray,
         done: bool,
-    ) -> None:
+        priority: float = 1.0,
+    ) -> int:
         """Store one transition strictly on CPU."""
         state = np.asarray(state, dtype=self.dtype).reshape(-1)
         action = np.asarray(action, dtype=self.dtype).reshape(-1)
@@ -107,14 +124,17 @@ class ReplayBuffer:
                 f"Expected next_state_dim={self.state_dim}, but received {next_state.size}."
             )
 
-        self.states[self.ptr] = state
-        self.actions[self.ptr] = action
-        self.rewards[self.ptr, 0] = float(reward)
-        self.next_states[self.ptr] = next_state
-        self.dones[self.ptr, 0] = float(done)
+        insert_index = self.ptr
+        self.states[insert_index] = state
+        self.actions[insert_index] = action
+        self.rewards[insert_index, 0] = float(reward)
+        self.next_states[insert_index] = next_state
+        self.dones[insert_index, 0] = float(done)
+        self.priorities[insert_index] = self._sanitize_priority(priority)
 
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
+        return insert_index
 
     def sample(self, batch_size: int, device: torch.device | str) -> dict[str, torch.Tensor]:
         """Move only the sampled mini-batch to the target device."""
@@ -123,7 +143,7 @@ class ReplayBuffer:
                 f"Not enough samples in buffer: size={self.size}, batch_size={batch_size}."
             )
 
-        indices = np.random.randint(0, self.size, size=batch_size)
+        indices = self._sample_indices(batch_size)
         batch = {
             "states": torch.from_numpy(self.states[indices]),
             "actions": torch.from_numpy(self.actions[indices]),
@@ -133,8 +153,49 @@ class ReplayBuffer:
         }
         return {key: value.to(device) for key, value in batch.items()}
 
+    def update_priorities(
+        self,
+        indices: list[int] | np.ndarray,
+        priorities: list[float] | np.ndarray,
+    ) -> None:
+        """Update replay priorities for an existing set of CPU-side samples."""
+        if len(indices) != len(priorities):
+            raise ValueError("`indices` and `priorities` must have the same length.")
+        indices_np = np.asarray(indices, dtype=np.int64).reshape(-1)
+        priorities_np = np.asarray(priorities, dtype=np.float32).reshape(-1)
+        if np.any(indices_np < 0) or np.any(indices_np >= self.capacity):
+            raise ValueError("Replay priority indices are out of range.")
+        self.priorities[indices_np] = np.asarray(
+            [self._sanitize_priority(value) for value in priorities_np],
+            dtype=np.float32,
+        )
+
     def __len__(self) -> int:
         return self.size
+
+    def _sample_indices(self, batch_size: int) -> np.ndarray:
+        if not self.prioritized:
+            return np.random.randint(0, self.size, size=batch_size)
+
+        active_priorities = self.priorities[: self.size].astype(np.float64, copy=False)
+        active_priorities = np.maximum(active_priorities, self.priority_epsilon)
+        weighted = active_priorities ** self.priority_alpha
+        weighted_sum = float(np.sum(weighted))
+        if not np.isfinite(weighted_sum) or weighted_sum <= 0.0:
+            return np.random.randint(0, self.size, size=batch_size)
+
+        probs = weighted / weighted_sum
+        if self.uniform_ratio > 0.0:
+            uniform_probs = np.full_like(probs, 1.0 / float(self.size))
+            probs = (1.0 - self.uniform_ratio) * probs + self.uniform_ratio * uniform_probs
+
+        return np.random.choice(self.size, size=batch_size, replace=True, p=probs)
+
+    def _sanitize_priority(self, priority: float) -> float:
+        priority = float(priority)
+        if not np.isfinite(priority):
+            priority = 1.0
+        return float(max(priority, self.priority_epsilon))
 
 
 class GroupedRISMapper:
@@ -328,7 +389,13 @@ class SACAgent:
             lr=config.critic_lr,
         )
 
-        init_log_alpha = np.log(config.init_alpha)
+        init_alpha = float(config.init_alpha)
+        if config.alpha_min is not None:
+            init_alpha = max(init_alpha, float(config.alpha_min))
+        if config.alpha_max is not None:
+            init_alpha = min(init_alpha, float(config.alpha_max))
+
+        init_log_alpha = np.log(init_alpha)
         self.log_alpha = torch.tensor(
             [init_log_alpha],
             dtype=torch.float32,
@@ -339,13 +406,31 @@ class SACAgent:
         self.target_entropy = (
             float(config.target_entropy)
             if config.target_entropy is not None
-            else -float(config.grouped_action_dim)
+            else -float(
+                config.grouped_action_dim
+                if config.target_entropy_scale is None
+                else config.target_entropy_scale * config.grouped_action_dim
+            )
+        )
+        self.log_alpha_min = (
+            None
+            if config.alpha_min is None
+            else float(np.log(max(float(config.alpha_min), 1e-8)))
+        )
+        self.log_alpha_max = (
+            None
+            if config.alpha_max is None
+            else float(np.log(max(float(config.alpha_max), 1e-8)))
         )
 
         self.replay_buffer = ReplayBuffer(
             state_dim=config.state_dim,
             action_dim=config.grouped_action_dim,
             capacity=config.replay_capacity,
+            prioritized=config.prioritized_replay,
+            priority_alpha=config.replay_priority_alpha,
+            uniform_ratio=config.replay_uniform_ratio,
+            priority_epsilon=config.replay_priority_epsilon,
         )
 
     @property
@@ -377,6 +462,8 @@ class SACAgent:
         self,
         state_tensor: torch.Tensor,
         deterministic: bool = False,
+        exploration_scale: float = 1.0,
+        additive_noise_std: float = 0.0,
     ) -> torch.Tensor:
         """Sample a grouped action tensor on the agent device."""
         if state_tensor.ndim == 1:
@@ -385,7 +472,15 @@ class SACAgent:
         self.actor.eval()
         with torch.no_grad():
             sampled_action, _, deterministic_action = self.actor.sample(state_tensor)
-            action = deterministic_action if deterministic else sampled_action
+            if deterministic:
+                action = deterministic_action
+            else:
+                action = deterministic_action + float(exploration_scale) * (
+                    sampled_action - deterministic_action
+                )
+                if additive_noise_std > 0.0:
+                    action = action + float(additive_noise_std) * torch.randn_like(action)
+                action = action.clamp(-1.0, 1.0)
         self.actor.train()
         return action.squeeze(0)
 
@@ -416,20 +511,45 @@ class SACAgent:
         reward: float,
         next_state: np.ndarray,
         done: bool,
-    ) -> None:
+        priority: float = 1.0,
+    ) -> int:
         """Store grouped actions only, never the expanded 10000-D physical action."""
-        self.replay_buffer.add(state, grouped_action, reward, next_state, done)
+        return self.replay_buffer.add(
+            state,
+            grouped_action,
+            reward,
+            next_state,
+            done,
+            priority=priority,
+        )
+
+    def update_replay_priorities(
+        self,
+        indices: list[int] | np.ndarray,
+        priorities: list[float] | np.ndarray,
+    ) -> None:
+        self.replay_buffer.update_priorities(indices, priorities)
 
     def ready(self) -> bool:
         return len(self.replay_buffer) >= self.config.batch_size
 
-    def update(self) -> dict[str, float]:
+    def update(
+        self,
+        *,
+        update_actor: bool = True,
+        update_alpha: bool | None = None,
+        update_target: bool | None = None,
+    ) -> dict[str, float | None]:
         """Perform one SAC update step from a CPU-resident replay buffer."""
         if not self.ready():
             raise ValueError(
                 f"Replay buffer has {len(self.replay_buffer)} samples, "
                 f"need at least {self.config.batch_size}."
             )
+        if update_alpha is None:
+            update_alpha = update_actor
+        if update_target is None:
+            update_target = update_actor
 
         batch = self.replay_buffer.sample(self.config.batch_size, self.device)
         states = batch["states"]
@@ -451,30 +571,47 @@ class SACAgent:
         critic_loss.backward()
         self.critic_optimizer.step()
 
-        new_actions, log_prob, _ = self.actor.sample(states)
-        q1_pi, q2_pi = self.critic(states, new_actions)
-        min_q_pi = torch.min(q1_pi, q2_pi)
-        actor_loss = (self.alpha.detach() * log_prob - min_q_pi).mean()
+        actor_loss = None
+        alpha_loss = None
+        alpha_value = float(self.alpha.detach().cpu().item())
+        mean_q = None
+        mean_log_prob = None
+        actor_updated = 0.0
 
-        self.actor_optimizer.zero_grad(set_to_none=True)
-        actor_loss.backward()
-        self.actor_optimizer.step()
+        if update_actor:
+            new_actions, log_prob, _ = self.actor.sample(states)
+            q1_pi, q2_pi = self.critic(states, new_actions)
+            min_q_pi = torch.min(q1_pi, q2_pi)
+            actor_loss = (self.alpha.detach() * log_prob - min_q_pi).mean()
 
-        alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            actor_loss.backward()
+            self.actor_optimizer.step()
+            actor_updated = 1.0
 
-        self.alpha_optimizer.zero_grad(set_to_none=True)
-        alpha_loss.backward()
-        self.alpha_optimizer.step()
+            mean_q = float(min_q_pi.detach().mean().cpu().item())
+            mean_log_prob = float(log_prob.detach().mean().cpu().item())
 
-        self._soft_update_target_network()
+            if update_alpha:
+                alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
+
+                self.alpha_optimizer.zero_grad(set_to_none=True)
+                alpha_loss.backward()
+                self.alpha_optimizer.step()
+                self._clamp_log_alpha()
+                alpha_value = float(self.alpha.detach().cpu().item())
+
+        if update_target:
+            self._soft_update_target_network()
 
         return {
             "critic_loss": float(critic_loss.detach().cpu().item()),
-            "actor_loss": float(actor_loss.detach().cpu().item()),
-            "alpha_loss": float(alpha_loss.detach().cpu().item()),
-            "alpha": float(self.alpha.detach().cpu().item()),
-            "mean_q": float(min_q_pi.detach().mean().cpu().item()),
-            "mean_log_prob": float(log_prob.detach().mean().cpu().item()),
+            "actor_loss": None if actor_loss is None else float(actor_loss.detach().cpu().item()),
+            "alpha_loss": None if alpha_loss is None else float(alpha_loss.detach().cpu().item()),
+            "alpha": alpha_value,
+            "mean_q": mean_q,
+            "mean_log_prob": mean_log_prob,
+            "actor_updated": actor_updated,
         }
 
     def save(self, path: str) -> None:
@@ -509,3 +646,10 @@ class SACAgent:
         ):
             target_param.data.mul_(1.0 - self.config.tau)
             target_param.data.add_(self.config.tau * param.data)
+
+    def _clamp_log_alpha(self) -> None:
+        with torch.no_grad():
+            if self.log_alpha_min is not None:
+                self.log_alpha.data.clamp_(min=self.log_alpha_min)
+            if self.log_alpha_max is not None:
+                self.log_alpha.data.clamp_(max=self.log_alpha_max)

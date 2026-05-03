@@ -151,11 +151,19 @@ scales poorly with the number of reflecting elements.
 
 ## Engineering Guardrails For This Repo
 
-- Every executable entry must apply hard TensorFlow GPU memory isolation first:
+- On this machine, the validated stable runtime is `Sionna/TF on CPU` and
+  `PyTorch on GPU`. This avoids PTX JIT with `TensorFlow 2.15.x` on an
+  `RTX 5090`.
+- If TensorFlow GPU execution is re-enabled in a future software stack, every
+  executable entry must apply hard TensorFlow GPU memory isolation first:
   `memory_limit = 1024 * 14`.
-- PyTorch should own the remaining VRAM.
+- PyTorch should own the remaining VRAM whenever mixed GPU execution is used.
 - Start with batch size `1` on the Sionna side and increase only after memory
   profiling.
+- Split sample budgets by task:
+  - path solves
+  - coverage-map solves
+  - visibility probes
 - Prefer coarse grids or sampled user points before full dense maps.
 - Precompute static scene assets once; do not rebuild the RT scene every RL step.
 - Keep TensorFlow outputs in `float32` and transfer only compact arrays to

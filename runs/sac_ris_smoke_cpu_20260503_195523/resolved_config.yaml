@@ -1,0 +1,57 @@
+seed: 7
+env:
+  carrier_frequency_hz: 3500000000.0
+  bandwidth_hz: 10000000.0
+  tx_power_dbm: 30.0
+  noise_temperature_k: 290.0
+  tf_device: cpu
+  tf_memory_limit_mb: 14336
+  max_depth: 1
+  path_num_samples: 1024
+  coverage_num_samples: 4096
+  probe_num_samples: 32
+  state_num_paths: 8
+  rx_height_m: 1.5
+  rx_jitter_xy_m: 1.0
+  blind_spot_search_center:
+  - 0.0
+  - 0.0
+  - 1.5
+  blind_spot_search_size:
+  - 80.0
+  - 80.0
+  blind_spot_cell_size:
+  - 20.0
+  - 20.0
+  num_blind_spot_candidates: 4
+  require_native_ris: true
+agent:
+  grouped_rows: 10
+  grouped_cols: 10
+  physical_rows: 100
+  physical_cols: 100
+  hidden_dim: 256
+  gamma: 0.99
+  tau: 0.005
+  actor_lr: 0.0003
+  critic_lr: 0.0003
+  alpha_lr: 0.0003
+  init_alpha: 0.2
+  batch_size: 4
+  replay_capacity: 256
+  target_entropy: null
+  device: null
+train:
+  num_episodes: 3
+  max_steps_per_episode: 4
+  warmup_steps: 4
+  updates_per_step: 1
+  checkpoint_every: 0
+  deterministic_eval: false
+logging:
+  output_dir: runs
+  experiment_name: sac_ris_smoke_cpu
+  log_file: training.log
+  metrics_file: metrics.jsonl
+  csv_file: episode_metrics.csv
+  save_final_checkpoint: true
