@@ -134,6 +134,8 @@ Current recommended deployment-selection run:
   [best_eval_agent.pt](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/best_eval_agent.pt)
 - post-training re-eval winner:
   [best_final_reeval_agent.pt](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/best_final_reeval_agent.pt)
+- unified recommended export:
+  [recommended_agent.pt](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/recommended_agent.pt)
 
 The key new result is not a better training trajectory, but a better model
 selection protocol. The run-level training metrics remain:
@@ -152,8 +154,31 @@ However, the post-training 4-episode deterministic re-evaluation ranked:
 That means the current recommended protocol is:
 
 - use `best_eval_agent.pt` to track the best in-training checkpoint
-- use `best_final_reeval_agent.pt` as the final deployment/reporting candidate
-  when the re-eval protocol is enabled
+- use `recommended_agent.pt` as the stable downstream handoff artifact
+- when re-eval is enabled, `recommended_agent.pt` will point to the copied
+  `best_final_reeval_agent.pt`
+- when re-eval is disabled, `recommended_agent.pt` will fall back to the best
+  available training checkpoint
+
+Formal fixed blind-spot-set evaluation for that exported deployment checkpoint:
+
+- output dir:
+  [formal_fixed_blind_spot_eval](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/formal_fixed_blind_spot_eval)
+- report:
+  [formal_fixed_blind_spot_report.md](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/formal_fixed_blind_spot_eval/formal_fixed_blind_spot_report.md)
+- summary:
+  [formal_fixed_blind_spot_summary.yaml](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/formal_fixed_blind_spot_eval/formal_fixed_blind_spot_summary.yaml)
+
+This stricter protocol fixes the RX positions to the cached blind-spot
+candidates and sets `rx_jitter_xy_m = 0.0`. On the current validated 5-point
+set with 4 deterministic rollouts per point, the exported
+`recommended_agent.pt`:
+
+- stays close to the no-RIS baseline on average
+- beats no-RIS on `3 / 5` candidate means
+- beats the phase-gradient reflector on only `1 / 5` candidate means
+- has aggregate mean rate `9.742294`, below the reflector aggregate mean
+  `11.855664`
 
 Generated evaluation artifacts for the current mainline run:
 
@@ -181,7 +206,15 @@ One important caveat from the sampled visualization RX: the best checkpoint
 still underperforms the phase-gradient reflector on some local hard-user
 positions. That matches the run-level observation that average deterministic
 performance improved, but the hardest blind-spot realizations are not yet fully
-solved.
+solved. The new fixed-set formal evaluation makes that caveat much sharper:
+the current recommended deployment checkpoint is still not competitive with the
+classical reflector on the full cached hard-RX set.
+
+To reproduce that stricter fixed-set evaluation:
+
+```bash
+/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/.conda-py310/bin/python evaluate_fixed_blind_spots.py --run-dir runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530 --num-rollouts-per-candidate 4
+```
 
 ## Documentation
 

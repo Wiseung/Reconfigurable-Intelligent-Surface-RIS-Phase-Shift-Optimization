@@ -711,6 +711,12 @@ def _dedupe_candidate_checkpoints(records: list[dict[str, Any]]) -> list[dict[st
     return deduped
 
 
+def _copy_checkpoint_file(source: Path, destination: Path) -> None:
+    if source.resolve() == destination.resolve():
+        return
+    destination.write_bytes(source.read_bytes())
+
+
 def train(config_path: str | Path = "config.yaml") -> Path:
     config = load_config(config_path)
 
@@ -774,6 +780,10 @@ def train(config_path: str | Path = "config.yaml") -> Path:
     best_eval_metric_name = str(train_cfg.get("best_eval_metric", "eval_avg_reward"))
     best_eval_metric_value: float | None = None
     checkpoint_records: list[dict[str, Any]] = []
+    best_eval_checkpoint_path: Path | None = None
+    final_checkpoint_path: Path | None = None
+    recommended_checkpoint_path: Path | None = None
+    recommended_checkpoint_source: str | None = None
 
     for episode in range(1, total_episodes + 1):
         rx_block_episodes = _resolve_rx_block_episodes(
@@ -1083,6 +1093,7 @@ def train(config_path: str | Path = "config.yaml") -> Path:
                     best_eval_metric_value = candidate_metric
                     best_checkpoint_path = run_dir / "best_eval_agent.pt"
                     agent.save(str(best_checkpoint_path))
+                    best_eval_checkpoint_path = best_checkpoint_path
                     _record_candidate_checkpoint(
                         checkpoint_records,
                         path=best_checkpoint_path,
@@ -1206,10 +1217,9 @@ def train(config_path: str | Path = "config.yaml") -> Path:
                     )
                     best_source_path = Path(best_result["checkpoint_path"])
                     reevaluate_best_path = run_dir / "best_final_reeval_agent.pt"
-                    if best_source_path.resolve() != reevaluate_best_path.resolve():
-                        reevaluate_best_path.write_bytes(best_source_path.read_bytes())
-                    else:
-                        reevaluate_best_path = best_source_path
+                    _copy_checkpoint_file(best_source_path, reevaluate_best_path)
+                    recommended_checkpoint_path = reevaluate_best_path
+                    recommended_checkpoint_source = "final_checkpoint_reeval"
                     append_metrics_jsonl(
                         metrics_path,
                         {
@@ -1229,6 +1239,30 @@ def train(config_path: str | Path = "config.yaml") -> Path:
                 agent.load(str(current_agent_snapshot))
                 if current_agent_snapshot.exists():
                     current_agent_snapshot.unlink()
+
+    if recommended_checkpoint_path is None:
+        if best_eval_checkpoint_path is not None and best_eval_checkpoint_path.exists():
+            recommended_checkpoint_path = run_dir / "recommended_agent.pt"
+            _copy_checkpoint_file(best_eval_checkpoint_path, recommended_checkpoint_path)
+            recommended_checkpoint_source = "best_eval"
+        elif final_checkpoint_path is not None and final_checkpoint_path.exists():
+            recommended_checkpoint_path = run_dir / "recommended_agent.pt"
+            _copy_checkpoint_file(final_checkpoint_path, recommended_checkpoint_path)
+            recommended_checkpoint_source = "final"
+    else:
+        recommended_copy_path = run_dir / "recommended_agent.pt"
+        _copy_checkpoint_file(recommended_checkpoint_path, recommended_copy_path)
+        recommended_checkpoint_path = recommended_copy_path
+
+    if recommended_checkpoint_path is not None and recommended_checkpoint_source is not None:
+        append_metrics_jsonl(
+            metrics_path,
+            {
+                "type": "recommended_checkpoint",
+                "checkpoint_path": str(recommended_checkpoint_path),
+                "checkpoint_source": recommended_checkpoint_source,
+            },
+        )
 
     if writer is not None:
         writer.flush()

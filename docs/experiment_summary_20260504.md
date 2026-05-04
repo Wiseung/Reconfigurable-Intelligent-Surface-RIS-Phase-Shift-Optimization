@@ -26,7 +26,7 @@ Why this line is preferred:
 - run:
   [runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530)
 - deployment checkpoint:
-  [best_final_reeval_agent.pt](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/best_final_reeval_agent.pt)
+  [recommended_agent.pt](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/recommended_agent.pt)
 
 Why this protocol is now preferred for reporting or deployment:
 
@@ -36,6 +36,36 @@ Why this protocol is now preferred for reporting or deployment:
 - it decouples in-training `best_eval` tracking from final model selection
 - it selected `checkpoint_episode_0036.pt` over both `best_eval_agent.pt` and
   `final_agent.pt` in the validated run
+- it exports a single stable artifact name for downstream scripts and reports
+
+## Formal Fixed Blind-Spot Evaluation
+
+- output dir:
+  [formal_fixed_blind_spot_eval](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/formal_fixed_blind_spot_eval)
+- report:
+  [formal_fixed_blind_spot_report.md](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/formal_fixed_blind_spot_eval/formal_fixed_blind_spot_report.md)
+- summary:
+  [formal_fixed_blind_spot_summary.yaml](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/formal_fixed_blind_spot_eval/formal_fixed_blind_spot_summary.yaml)
+
+This stricter evaluation uses the cached blind-spot candidate set directly,
+forces `rx_jitter_xy_m = 0.0`, and runs 4 deterministic rollouts per candidate.
+
+Key aggregate results for the exported `recommended_agent.pt`:
+
+- `no_ris_rate_mean_over_candidates = 9.766755`
+- `phase_gradient_reflector_rate_mean_over_candidates = 11.855664`
+- `drl_avg_rate_mean_over_candidates = 9.742294`
+- `drl_final_rate_mean_over_candidates = 9.742294`
+- `candidate_mean_avg_beats_reflector_rate = 0.2`
+- `candidate_mean_avg_beats_no_ris_rate = 0.6`
+
+Interpretation:
+
+- the re-eval protocol is still the right deployment-selection mechanism
+- but the currently recommended checkpoint is not yet strong enough on the full
+  fixed hard-RX set
+- on this stricter set-level metric, the classical phase-gradient reflector is
+  still clearly stronger than the DRL policy
 
 ## Result Table
 

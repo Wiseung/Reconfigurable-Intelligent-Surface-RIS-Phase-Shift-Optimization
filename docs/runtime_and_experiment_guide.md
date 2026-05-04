@@ -160,6 +160,7 @@ The intended behavior is:
 - keep `final_agent.pt` as the literal training endpoint
 - run a final deterministic re-ranking pass and save the winner as
   `best_final_reeval_agent.pt`
+- always export `recommended_agent.pt` as the single downstream handoff file
 
 Validated run:
 
@@ -181,7 +182,7 @@ That means the recommended reporting flow is now:
 1. train with dense deterministic eval and periodic checkpoints
 2. store `best_eval_agent.pt` during training
 3. run final multi-checkpoint deterministic re-evaluation
-4. report and deploy `best_final_reeval_agent.pt`
+4. report and deploy `recommended_agent.pt`
 
 ## Known Runtime Signals
 
@@ -204,6 +205,10 @@ If any of those appear, check whether:
 - another module imported `sionna.rt` too early
 - a custom script bypassed `train_loop.py`
 
+The same import-order rule also applies to post-training analysis scripts.
+`evaluate_fixed_blind_spots.py` deliberately constructs `SionnaRISEnv` before
+importing the PyTorch SAC module so that Sionna RT stays on `llvm_ad_rgb`.
+
 ## Training Commands
 
 Smoke run:
@@ -224,6 +229,13 @@ Validated pilot run:
 /home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/.conda-py310/bin/python train_loop.py --config configs/pilot_cpu.yaml
 ```
 
+Formal fixed blind-spot-set evaluation for the current recommended deployment
+checkpoint:
+
+```bash
+/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/.conda-py310/bin/python evaluate_fixed_blind_spots.py --run-dir runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530 --num-rollouts-per-candidate 4
+```
+
 ## Output Artifacts
 
 Each run directory under `runs/` contains:
@@ -239,8 +251,25 @@ Each run directory under `runs/` contains:
 When final checkpoint re-evaluation is enabled, the run can also contain:
 
 - `best_final_reeval_agent.pt`
+- `recommended_agent.pt`
 - `final_checkpoint_reeval_candidate` events in `metrics.jsonl`
 - `final_checkpoint_reeval_best` event in `metrics.jsonl`
+- `recommended_checkpoint` event in `metrics.jsonl`
+
+When the formal fixed-set evaluation is run on a deployment checkpoint, the
+selected run directory can also contain:
+
+- `formal_fixed_blind_spot_eval/formal_fixed_blind_spot_rollout_metrics.csv`
+- `formal_fixed_blind_spot_eval/formal_fixed_blind_spot_candidate_metrics.csv`
+- `formal_fixed_blind_spot_eval/formal_fixed_blind_spot_aggregate_summary.csv`
+- `formal_fixed_blind_spot_eval/formal_fixed_blind_spot_summary.yaml`
+- `formal_fixed_blind_spot_eval/formal_fixed_blind_spot_report.md`
+- `formal_fixed_blind_spot_eval/formal_learning_curve.png`
+- `formal_fixed_blind_spot_eval/formal_fixed_blind_spot_rate_by_candidate.png`
+- `formal_fixed_blind_spot_eval/formal_fixed_blind_spot_margin_vs_reflector.png`
+- `formal_fixed_blind_spot_eval/formal_fixed_blind_spot_aggregate_bar.png`
+- `formal_fixed_blind_spot_eval/formal_fixed_blind_spot_phase_profile_representative.png`
+- `formal_fixed_blind_spot_eval/formal_fixed_blind_spot_coverage_representative.png`
 
 These outputs are the intended inputs for:
 
@@ -272,6 +301,23 @@ are:
 - [phase_profile_best_final_reeval.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/phase_profile_best_final_reeval.png)
 - [coverage_comparison_best_final_reeval.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/coverage_comparison_best_final_reeval.png)
 - [best_final_reeval_visualization_summary.yaml](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/best_final_reeval_visualization_summary.yaml)
+
+For the stricter fixed blind-spot set evaluation of the exported
+`recommended_agent.pt`, the generated report-ready artifacts are:
+
+- [formal_fixed_blind_spot_report.md](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/formal_fixed_blind_spot_eval/formal_fixed_blind_spot_report.md)
+- [formal_fixed_blind_spot_summary.yaml](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/formal_fixed_blind_spot_eval/formal_fixed_blind_spot_summary.yaml)
+- [formal_learning_curve.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/formal_fixed_blind_spot_eval/formal_learning_curve.png)
+- [formal_fixed_blind_spot_rate_by_candidate.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/formal_fixed_blind_spot_eval/formal_fixed_blind_spot_rate_by_candidate.png)
+- [formal_fixed_blind_spot_margin_vs_reflector.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/formal_fixed_blind_spot_eval/formal_fixed_blind_spot_margin_vs_reflector.png)
+- [formal_fixed_blind_spot_aggregate_bar.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/formal_fixed_blind_spot_eval/formal_fixed_blind_spot_aggregate_bar.png)
+- [formal_fixed_blind_spot_phase_profile_representative.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/formal_fixed_blind_spot_eval/formal_fixed_blind_spot_phase_profile_representative.png)
+- [formal_fixed_blind_spot_coverage_representative.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/formal_fixed_blind_spot_eval/formal_fixed_blind_spot_coverage_representative.png)
+
+This stricter set-level evaluation currently shows that the exported DRL policy
+is still below the classical reflector on average over the 5 cached blind-spot
+candidates, even though the post-training re-eval protocol remains useful for
+choosing the most reliable DRL checkpoint.
 
 ## Experimental Caveat
 
