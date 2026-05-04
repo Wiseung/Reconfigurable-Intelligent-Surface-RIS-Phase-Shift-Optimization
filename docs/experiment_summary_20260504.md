@@ -19,6 +19,24 @@ Why this line is preferred:
 - it avoids the final-eval collapse observed on the `rx3` family
 - it now stores the best deterministic checkpoint explicitly
 
+## Recommended Deployment Protocol
+
+- config:
+  [configs/pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval.yaml](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/configs/pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval.yaml)
+- run:
+  [runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530)
+- deployment checkpoint:
+  [best_final_reeval_agent.pt](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/best_final_reeval_agent.pt)
+
+Why this protocol is now preferred for reporting or deployment:
+
+- it preserves the strongest current training trajectory
+- it compares multiple candidate checkpoints under one stricter deterministic
+  evaluation protocol
+- it decouples in-training `best_eval` tracking from final model selection
+- it selected `checkpoint_episode_0036.pt` over both `best_eval_agent.pt` and
+  `final_agent.pt` in the validated run
+
 ## Result Table
 
 | Branch | Run | avg_all | avg_tail10 | avg_tail5 | best_eval | last_eval |
@@ -36,6 +54,9 @@ Why this line is preferred:
 - `rx2 + exclusive hard replay + actor gate + dense deterministic eval + best
   checkpoint capture` is the best current balance between training stability
   and final deterministic evaluation quality.
+- the newest improvement is procedural rather than architectural:
+  final deployment should use post-training deterministic checkpoint re-ranking
+  instead of blindly trusting the last `best_eval_agent.pt`
 
 ## Report-Ready Figures
 
@@ -44,6 +65,12 @@ The current mainline run already has generated figures:
 - [learning_curve_best_eval_checkpoint.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_20260504_145046/learning_curve_best_eval_checkpoint.png)
 - [phase_profile_best_eval_checkpoint.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_20260504_145046/phase_profile_best_eval_checkpoint.png)
 - [coverage_comparison_best_eval_checkpoint.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_20260504_145046/coverage_comparison_best_eval_checkpoint.png)
+
+The current re-eval-selected run also has generated figures:
+
+- [learning_curve_best_final_reeval.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/learning_curve_best_final_reeval.png)
+- [phase_profile_best_final_reeval.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/phase_profile_best_final_reeval.png)
+- [coverage_comparison_best_final_reeval.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/coverage_comparison_best_final_reeval.png)
 
 ## Caveat
 

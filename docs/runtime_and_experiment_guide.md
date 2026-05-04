@@ -144,6 +144,45 @@ Interpretation:
 - Best-checkpoint capture should now be treated as part of the standard run
   protocol, not an optional add-on.
 
+### 5. Recommended deployment-selection protocol
+
+Use [configs/pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval.yaml](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/configs/pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval.yaml).
+
+This protocol keeps the same training dynamics as the current mainline but adds
+one important post-training step:
+
+- deterministic re-evaluation of multiple candidate checkpoints
+
+The intended behavior is:
+
+- keep `best_eval_agent.pt` as the best in-training checkpoint
+- keep periodic checkpoints for candidate comparison
+- keep `final_agent.pt` as the literal training endpoint
+- run a final deterministic re-ranking pass and save the winner as
+  `best_final_reeval_agent.pt`
+
+Validated run:
+
+- run dir:
+  [runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530)
+- selected checkpoint:
+  [best_final_reeval_agent.pt](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/best_final_reeval_agent.pt)
+
+What happened in this run:
+
+- training metrics matched the current best mainline trajectory
+- final 4-episode deterministic re-evaluation preferred
+  `checkpoint_episode_0036.pt`
+- `checkpoint_episode_0036.pt` beat both `best_eval_agent.pt` and `final_agent.pt`
+  on the stricter post-training evaluation protocol
+
+That means the recommended reporting flow is now:
+
+1. train with dense deterministic eval and periodic checkpoints
+2. store `best_eval_agent.pt` during training
+3. run final multi-checkpoint deterministic re-evaluation
+4. report and deploy `best_final_reeval_agent.pt`
+
 ## Known Runtime Signals
 
 Expected:
@@ -197,6 +236,12 @@ Each run directory under `runs/` contains:
 - checkpoints
 - `final_agent.pt`
 
+When final checkpoint re-evaluation is enabled, the run can also contain:
+
+- `best_final_reeval_agent.pt`
+- `final_checkpoint_reeval_candidate` events in `metrics.jsonl`
+- `final_checkpoint_reeval_best` event in `metrics.jsonl`
+
 These outputs are the intended inputs for:
 
 - `plot_learning_curve()`
@@ -219,6 +264,14 @@ spot RX where:
 
 This is a useful reminder that run-level average improvements and local hard-RX
 performance are not yet the same thing in the current environment.
+
+For the current re-eval-selected checkpoint, the generated report-ready figures
+are:
+
+- [learning_curve_best_final_reeval.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/learning_curve_best_final_reeval.png)
+- [phase_profile_best_final_reeval.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/phase_profile_best_final_reeval.png)
+- [coverage_comparison_best_final_reeval.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/coverage_comparison_best_final_reeval.png)
+- [best_final_reeval_visualization_summary.yaml](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/best_final_reeval_visualization_summary.yaml)
 
 ## Experimental Caveat
 

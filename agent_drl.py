@@ -48,6 +48,10 @@ class SACConfig:
     dual_replay: bool = False
     hard_replay_capacity: int | None = None
     hard_replay_ratio: float = 0.25
+    hard_replay_prioritized: bool = False
+    hard_replay_priority_alpha: float = 1.0
+    hard_replay_uniform_ratio: float = 0.0
+    hard_replay_priority_epsilon: float = 1e-3
     prioritized_replay: bool = False
     replay_priority_alpha: float = 1.0
     replay_uniform_ratio: float = 0.0
@@ -448,7 +452,10 @@ class SACAgent:
                 state_dim=config.state_dim,
                 action_dim=config.grouped_action_dim,
                 capacity=hard_replay_capacity,
-                prioritized=False,
+                prioritized=config.hard_replay_prioritized,
+                priority_alpha=config.hard_replay_priority_alpha,
+                uniform_ratio=config.hard_replay_uniform_ratio,
+                priority_epsilon=config.hard_replay_priority_epsilon,
             )
 
     @property
@@ -555,6 +562,7 @@ class SACAgent:
         reward: float,
         next_state: np.ndarray,
         done: bool,
+        priority: float = 1.0,
     ) -> int | None:
         if self.hard_replay_buffer is None:
             return None
@@ -564,8 +572,17 @@ class SACAgent:
             reward,
             next_state,
             done,
-            priority=1.0,
+            priority=priority,
         )
+
+    def update_hard_replay_priorities(
+        self,
+        indices: list[int] | np.ndarray,
+        priorities: list[float] | np.ndarray,
+    ) -> None:
+        if self.hard_replay_buffer is None:
+            return
+        self.hard_replay_buffer.update_priorities(indices, priorities)
 
     def ready(self) -> bool:
         return len(self.replay_buffer) >= self.config.batch_size

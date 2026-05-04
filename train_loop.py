@@ -99,6 +99,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "rx_block_episodes_start": None,
         "rx_block_episodes_end": None,
         "rx_block_transition_episode": None,
+        "hard_rx_focus_enabled": False,
+        "hard_rx_focus_start_episode": 1,
+        "hard_rx_focus_end_episode": None,
+        "hard_rx_focus_probability": 0.5,
+        "hard_rx_focus_gap_power": 1.0,
+        "hard_rx_focus_min_gap": 0.25,
+        "hard_rx_focus_warmup_episodes": 0,
+        "hard_rx_priority_scale": 0.0,
         "updates_per_step": 1,
         "checkpoint_every": 10,
         "deterministic_eval": False,
@@ -106,6 +114,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "eval_num_episodes": 2,
         "save_best_eval_checkpoint": False,
         "best_eval_metric": "eval_avg_reward",
+        "final_checkpoint_reeval_enabled": False,
+        "final_checkpoint_reeval_num_episodes": None,
+        "final_checkpoint_reeval_last_k_checkpoints": 0,
+        "final_checkpoint_reeval_include_best_eval": True,
+        "final_checkpoint_reeval_include_final": True,
+        "final_checkpoint_reeval_metric": "eval_avg_reward",
         "reward_margin_weight": 0.0,
         "reward_margin_positive_weight": None,
         "reward_margin_negative_weight": None,
@@ -339,6 +353,85 @@ def _resolve_rx_block_episodes(
     transition_episode = max(1, int(transition_episode))
 
     return start_block if int(episode) < transition_episode else end_block
+
+
+def initialize_hard_rx_stats(env) -> dict[int, dict[str, float]]:
+    """Create per-candidate hard-RX statistics for blind-spot focused sampling."""
+    candidate_count = int(getattr(env, "num_available_blind_spot_candidates", 0))
+    return {
+        idx: {
+            "episodes": 0.0,
+            "avg_gap": 0.0,
+            "last_gap": 0.0,
+        }
+        for idx in range(candidate_count)
+    }
+
+
+def select_rx_candidate_index(
+    env,
+    *,
+    train_cfg: dict[str, Any],
+    episode: int,
+    reuse_rx_position: bool,
+    hard_rx_stats: dict[int, dict[str, float]],
+) -> tuple[int | None, float, float]:
+    """Optionally bias sampling toward blind-spot candidates with larger historical gaps."""
+    if reuse_rx_position:
+        return None, 0.0, 0.0
+    if not bool(train_cfg.get("hard_rx_focus_enabled", False)):
+        return None, 0.0, 0.0
+    if int(episode) < int(train_cfg.get("hard_rx_focus_start_episode", 1)):
+        return None, 0.0, 0.0
+    end_episode = train_cfg.get("hard_rx_focus_end_episode", None)
+    if end_episode is not None and int(episode) > int(end_episode):
+        return None, 0.0, 0.0
+
+    warmup_episodes = max(0, int(train_cfg.get("hard_rx_focus_warmup_episodes", 0)))
+    eligible = [
+        idx
+        for idx, stats in hard_rx_stats.items()
+        if stats["episodes"] >= warmup_episodes
+    ]
+    if not eligible:
+        return None, 0.0, 0.0
+
+    focus_probability = float(np.clip(train_cfg.get("hard_rx_focus_probability", 0.5), 0.0, 1.0))
+    if np.random.random() >= focus_probability:
+        return None, 0.0, 0.0
+
+    min_gap = float(max(train_cfg.get("hard_rx_focus_min_gap", 0.0), 0.0))
+    gap_power = float(max(train_cfg.get("hard_rx_focus_gap_power", 1.0), 1e-6))
+    weights = []
+    for idx in eligible:
+        avg_gap = max(float(hard_rx_stats[idx]["avg_gap"]), 0.0)
+        weight = max(avg_gap, min_gap) ** gap_power
+        weights.append(weight)
+    weights_np = np.asarray(weights, dtype=np.float64)
+    if not np.isfinite(weights_np).all() or float(np.sum(weights_np)) <= 0.0:
+        return None, 0.0, 0.0
+    probs = weights_np / float(np.sum(weights_np))
+    chosen_offset = int(np.random.choice(len(eligible), p=probs))
+    chosen_index = int(eligible[chosen_offset])
+    return chosen_index, float(probs[chosen_offset]), float(hard_rx_stats[chosen_index]["avg_gap"])
+
+
+def update_hard_rx_stats(
+    hard_rx_stats: dict[int, dict[str, float]],
+    *,
+    candidate_index: int | None,
+    episode_gap: float | None,
+) -> None:
+    """Update per-candidate average hard gap after one episode block."""
+    if candidate_index is None or candidate_index not in hard_rx_stats or episode_gap is None:
+        return
+    gap = max(float(episode_gap), 0.0)
+    stats = hard_rx_stats[candidate_index]
+    episodes = int(stats["episodes"])
+    new_count = episodes + 1
+    stats["avg_gap"] = (float(stats["avg_gap"]) * episodes + gap) / float(new_count)
+    stats["episodes"] = float(new_count)
+    stats["last_gap"] = gap
 
 
 def should_freeze_actor_for_episode(
@@ -590,6 +683,34 @@ def maybe_write_tensorboard(writer, payload: dict[str, Any], step: int) -> None:
             writer.add_scalar(key, value, global_step=step)
 
 
+def _record_candidate_checkpoint(
+    records: list[dict[str, Any]],
+    *,
+    path: Path,
+    source: str,
+    episode: int | None,
+) -> None:
+    records.append(
+        {
+            "path": str(path),
+            "source": str(source),
+            "episode": None if episode is None else int(episode),
+        }
+    )
+
+
+def _dedupe_candidate_checkpoints(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in records:
+        path = str(record["path"])
+        if path in seen:
+            continue
+        seen.add(path)
+        deduped.append(record)
+    return deduped
+
+
 def train(config_path: str | Path = "config.yaml") -> Path:
     config = load_config(config_path)
 
@@ -645,12 +766,14 @@ def train(config_path: str | Path = "config.yaml") -> Path:
     train_cfg = config["train"]
     dual_replay_enabled = bool(config["agent"].get("dual_replay", False))
     hard_replay_route_mode = resolve_hard_replay_route_mode(train_cfg)
+    hard_rx_stats = initialize_hard_rx_stats(env)
     global_step = 0
     gradient_step = 0
     actor_update_wait = 0
     total_episodes = int(train_cfg["num_episodes"])
     best_eval_metric_name = str(train_cfg.get("best_eval_metric", "eval_avg_reward"))
     best_eval_metric_value: float | None = None
+    checkpoint_records: list[dict[str, Any]] = []
 
     for episode in range(1, total_episodes + 1):
         rx_block_episodes = _resolve_rx_block_episodes(
@@ -659,7 +782,20 @@ def train(config_path: str | Path = "config.yaml") -> Path:
             total_episodes=total_episodes,
         )
         reuse_rx_position = episode > 1 and ((episode - 1) % rx_block_episodes != 0)
-        state = env.reset(reuse_rx_position=reuse_rx_position)
+        selected_rx_candidate_index, hard_rx_focus_prob, selected_rx_avg_gap = (
+            select_rx_candidate_index(
+                env,
+                train_cfg=train_cfg,
+                episode=episode,
+                reuse_rx_position=reuse_rx_position,
+                hard_rx_stats=hard_rx_stats,
+            )
+        )
+        state = env.reset(
+            reuse_rx_position=reuse_rx_position,
+            candidate_index=selected_rx_candidate_index,
+        )
+        active_rx_candidate_index = getattr(env, "current_rx_candidate_index", None)
         episode_baselines = maybe_evaluate_episode_baselines(
             env,
             train_cfg=train_cfg,
@@ -717,6 +853,16 @@ def train(config_path: str | Path = "config.yaml") -> Path:
                 episode_margin=None,
                 train_cfg=train_cfg,
             )
+            hard_rx_priority_scale = float(train_cfg.get("hard_rx_priority_scale", 0.0))
+            if hard_rx_priority_scale > 0.0:
+                transition_priority += hard_rx_priority_scale * max(selected_rx_avg_gap, 0.0)
+                transition_priority = float(
+                    np.clip(
+                        transition_priority,
+                        1e-6,
+                        float(train_cfg.get("hard_priority_max", 10.0)),
+                    )
+                )
             episode_transition_payloads.append(
                 {
                     "state": np.asarray(state, dtype=np.float32).copy(),
@@ -787,6 +933,12 @@ def train(config_path: str | Path = "config.yaml") -> Path:
         episode_margin = None
         if episode_baseline_reference is not None:
             episode_margin = (episode_reward / max(steps_this_episode, 1)) - episode_baseline_reference
+        episode_hard_gap = None if episode_margin is None else max(-episode_margin, 0.0)
+        update_hard_rx_stats(
+            hard_rx_stats,
+            candidate_index=active_rx_candidate_index,
+            episode_gap=episode_hard_gap,
+        )
         if dual_replay_enabled and episode_transition_payloads:
             for payload in episode_transition_payloads:
                 is_hard = should_store_hard_transition(
@@ -807,6 +959,7 @@ def train(config_path: str | Path = "config.yaml") -> Path:
                             payload["reward"],
                             payload["next_state"],
                             payload["done"],
+                            priority=transition_priority,
                         )
                         hard_replay_added += 1
                     else:
@@ -825,6 +978,7 @@ def train(config_path: str | Path = "config.yaml") -> Path:
                         payload["reward"],
                         payload["next_state"],
                         payload["done"],
+                        priority=transition_priority,
                     )
                     hard_replay_added += 1
         elif episode_transition_records and (
@@ -866,13 +1020,20 @@ def train(config_path: str | Path = "config.yaml") -> Path:
             "avg_reward_margin": None
             if episode_baseline_reference is None
             else avg_reward - episode_baseline_reference,
-            "avg_hard_block_gap": None if episode_margin is None else max(-episode_margin, 0.0),
+            "avg_hard_block_gap": episode_hard_gap,
             "hard_replay_added": hard_replay_added,
             "episode_no_ris_rate": episode_baselines.get("no_ris_rate"),
             "episode_phase_gradient_reflector_rate": episode_baselines.get(
                 "phase_gradient_reflector_rate"
             ),
             "episode_reward_baseline": episode_baseline_reference,
+            "rx_candidate_index": active_rx_candidate_index,
+            "rx_focus_selected": float(selected_rx_candidate_index is not None),
+            "rx_focus_selection_prob": hard_rx_focus_prob,
+            "rx_focus_candidate_avg_gap": selected_rx_avg_gap,
+            "rx_candidate_avg_gap_after_episode": None
+            if active_rx_candidate_index is None
+            else float(hard_rx_stats[active_rx_candidate_index]["avg_gap"]),
             "avg_actor_loss": _safe_mean(loss_accumulator["actor_loss"]),
             "avg_critic_loss": _safe_mean(loss_accumulator["critic_loss"]),
             "avg_alpha_loss": _safe_mean(loss_accumulator["alpha_loss"]),
@@ -899,10 +1060,12 @@ def train(config_path: str | Path = "config.yaml") -> Path:
         }
 
         logger.info(
-            "Episode %03d | avg_reward=%.6f | avg_shaped_reward=%.6f | det_frac=%s | actor_upd=%s | critic_loss=%s | eval_reward=%s",
+            "Episode %03d | avg_reward=%.6f | avg_shaped_reward=%.6f | rx_idx=%s | rx_gap=%s | det_frac=%s | actor_upd=%s | critic_loss=%s | eval_reward=%s",
             summary["episode"],
             summary["avg_reward"],
             summary["avg_shaped_reward"],
+            "n/a" if summary["rx_candidate_index"] is None else int(summary["rx_candidate_index"]),
+            _fmt_float(summary["rx_candidate_avg_gap_after_episode"]),
             _fmt_float(summary["avg_collection_deterministic"]),
             _fmt_float(summary["avg_actor_updated"]),
             _fmt_float(summary["avg_critic_loss"]),
@@ -920,6 +1083,12 @@ def train(config_path: str | Path = "config.yaml") -> Path:
                     best_eval_metric_value = candidate_metric
                     best_checkpoint_path = run_dir / "best_eval_agent.pt"
                     agent.save(str(best_checkpoint_path))
+                    _record_candidate_checkpoint(
+                        checkpoint_records,
+                        path=best_checkpoint_path,
+                        source="best_eval",
+                        episode=episode,
+                    )
                     append_metrics_jsonl(
                         metrics_path,
                         {
@@ -935,9 +1104,131 @@ def train(config_path: str | Path = "config.yaml") -> Path:
         if checkpoint_every > 0 and episode % checkpoint_every == 0:
             checkpoint_path = run_dir / f"checkpoint_episode_{episode:04d}.pt"
             agent.save(str(checkpoint_path))
+            _record_candidate_checkpoint(
+                checkpoint_records,
+                path=checkpoint_path,
+                source="periodic",
+                episode=episode,
+            )
 
     if config["logging"].get("save_final_checkpoint", True):
-        agent.save(str(run_dir / "final_agent.pt"))
+        final_checkpoint_path = run_dir / "final_agent.pt"
+        agent.save(str(final_checkpoint_path))
+        _record_candidate_checkpoint(
+            checkpoint_records,
+            path=final_checkpoint_path,
+            source="final",
+            episode=total_episodes,
+        )
+
+    if bool(train_cfg.get("final_checkpoint_reeval_enabled", False)):
+        reevaluate_candidates = _dedupe_candidate_checkpoints(checkpoint_records)
+        last_k_checkpoints = max(
+            0,
+            int(train_cfg.get("final_checkpoint_reeval_last_k_checkpoints", 0)),
+        )
+        include_best_eval = bool(train_cfg.get("final_checkpoint_reeval_include_best_eval", True))
+        include_final = bool(train_cfg.get("final_checkpoint_reeval_include_final", True))
+
+        filtered_candidates: list[dict[str, Any]] = []
+        periodic_candidates: list[dict[str, Any]] = []
+        for record in reevaluate_candidates:
+            if record["source"] == "periodic":
+                periodic_candidates.append(record)
+                continue
+            if record["source"] == "best_eval" and not include_best_eval:
+                continue
+            if record["source"] == "final" and not include_final:
+                continue
+            filtered_candidates.append(record)
+
+        if last_k_checkpoints > 0 and periodic_candidates:
+            periodic_candidates = sorted(
+                periodic_candidates,
+                key=lambda item: -1 if item["episode"] is None else int(item["episode"]),
+            )
+            filtered_candidates.extend(periodic_candidates[-last_k_checkpoints:])
+
+        filtered_candidates = _dedupe_candidate_checkpoints(filtered_candidates)
+        reevaluate_num_episodes = train_cfg.get("final_checkpoint_reeval_num_episodes", None)
+        reevaluate_eval_episodes = (
+            int(train_cfg.get("eval_num_episodes", 2))
+            if reevaluate_num_episodes is None
+            else int(reevaluate_num_episodes)
+        )
+        reevaluate_metric_name = str(
+            train_cfg.get("final_checkpoint_reeval_metric", "eval_avg_reward")
+        )
+
+        original_eval_num_episodes = train_cfg.get("eval_num_episodes", 2)
+        reevaluate_train_cfg = dict(train_cfg)
+        reevaluate_train_cfg["eval_num_episodes"] = reevaluate_eval_episodes
+
+        reevaluate_results: list[dict[str, Any]] = []
+        if filtered_candidates:
+            current_agent_snapshot = run_dir / "__reeval_restore_agent.pt"
+            agent.save(str(current_agent_snapshot))
+            try:
+                for candidate in filtered_candidates:
+                    candidate_path = Path(candidate["path"])
+                    if not candidate_path.exists():
+                        continue
+                    agent.load(str(candidate_path))
+                    eval_result = run_deterministic_eval(
+                        env=env,
+                        agent=agent,
+                        train_cfg=reevaluate_train_cfg,
+                        baselines=baselines,
+                    )
+                    metric_value = eval_result.get(reevaluate_metric_name)
+                    result = {
+                        "type": "final_checkpoint_reeval_candidate",
+                        "checkpoint_path": str(candidate_path),
+                        "checkpoint_source": candidate["source"],
+                        "episode": candidate["episode"],
+                        "reeval_num_episodes": reevaluate_eval_episodes,
+                        **eval_result,
+                        "reeval_metric_name": reevaluate_metric_name,
+                        "reeval_metric_value": metric_value,
+                    }
+                    reevaluate_results.append(result)
+                    append_metrics_jsonl(metrics_path, result)
+
+                valid_results = [
+                    item
+                    for item in reevaluate_results
+                    if item.get("reeval_metric_value") is not None
+                ]
+                if valid_results:
+                    best_result = max(
+                        valid_results,
+                        key=lambda item: float(item["reeval_metric_value"]),
+                    )
+                    best_source_path = Path(best_result["checkpoint_path"])
+                    reevaluate_best_path = run_dir / "best_final_reeval_agent.pt"
+                    if best_source_path.resolve() != reevaluate_best_path.resolve():
+                        reevaluate_best_path.write_bytes(best_source_path.read_bytes())
+                    else:
+                        reevaluate_best_path = best_source_path
+                    append_metrics_jsonl(
+                        metrics_path,
+                        {
+                            "type": "final_checkpoint_reeval_best",
+                            "checkpoint_path": str(reevaluate_best_path),
+                            "checkpoint_source": best_result["checkpoint_source"],
+                            "episode": best_result["episode"],
+                            "reeval_num_episodes": reevaluate_eval_episodes,
+                            "reeval_metric_name": reevaluate_metric_name,
+                            "reeval_metric_value": best_result["reeval_metric_value"],
+                            "eval_avg_reward": best_result.get("eval_avg_reward"),
+                            "eval_avg_shaped_reward": best_result.get("eval_avg_shaped_reward"),
+                            "eval_avg_reward_margin": best_result.get("eval_avg_reward_margin"),
+                        },
+                    )
+            finally:
+                agent.load(str(current_agent_snapshot))
+                if current_agent_snapshot.exists():
+                    current_agent_snapshot.unlink()
 
     if writer is not None:
         writer.flush()

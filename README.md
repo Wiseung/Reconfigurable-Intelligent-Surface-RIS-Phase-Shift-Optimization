@@ -68,6 +68,13 @@ Use the current formal 48-episode mainline configuration:
 /home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/.conda-py310/bin/python train_loop.py --config configs/pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval.yaml
 ```
 
+Use the current formal deployment-selection configuration with final checkpoint
+re-evaluation:
+
+```bash
+/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/.conda-py310/bin/python train_loop.py --config configs/pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval.yaml
+```
+
 Use the default longer CPU-Sionna configuration:
 
 ```bash
@@ -84,9 +91,13 @@ Artifacts are written under `runs/` and include:
 
 ## Current Mainline Result
 
-The current recommended formal pilot configuration is:
+The current recommended formal training configuration is:
 
 - [configs/pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval.yaml](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/configs/pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval.yaml)
+
+The current recommended formal deployment-selection configuration is:
+
+- [configs/pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval.yaml](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/configs/pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval.yaml)
 
 This run keeps the more reliable `rx_block_episodes=2` schedule and adds:
 
@@ -115,6 +126,35 @@ This slightly improves the previous `rx2` mainline best deterministic eval
 branch, which reached higher training returns but collapsed on final
 deterministic evaluation.
 
+Current recommended deployment-selection run:
+
+- run dir:
+  [runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530)
+- training-time best checkpoint:
+  [best_eval_agent.pt](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/best_eval_agent.pt)
+- post-training re-eval winner:
+  [best_final_reeval_agent.pt](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/best_final_reeval_agent.pt)
+
+The key new result is not a better training trajectory, but a better model
+selection protocol. The run-level training metrics remain:
+
+- `avg_all = 9.285641`
+- `avg_tail10 = 8.577790`
+- `avg_tail5 = 8.686258`
+- `best_eval = 11.301114`
+- `last_eval = 11.301114`
+
+However, the post-training 4-episode deterministic re-evaluation ranked:
+
+- `checkpoint_episode_0036.pt` first with `reeval eval_avg_reward = 9.848493`
+- `best_eval_agent.pt` and `final_agent.pt` below it at `9.775208`
+
+That means the current recommended protocol is:
+
+- use `best_eval_agent.pt` to track the best in-training checkpoint
+- use `best_final_reeval_agent.pt` as the final deployment/reporting candidate
+  when the re-eval protocol is enabled
+
 Generated evaluation artifacts for the current mainline run:
 
 - learning curve:
@@ -125,6 +165,17 @@ Generated evaluation artifacts for the current mainline run:
   [coverage_comparison_best_eval_checkpoint.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_20260504_145046/coverage_comparison_best_eval_checkpoint.png)
 - visualization summary:
   [best_eval_visualization_summary.yaml](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_20260504_145046/best_eval_visualization_summary.yaml)
+
+Generated evaluation artifacts for the re-eval-selected checkpoint:
+
+- learning curve:
+  [learning_curve_best_final_reeval.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/learning_curve_best_final_reeval.png)
+- phase profile:
+  [phase_profile_best_final_reeval.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/phase_profile_best_final_reeval.png)
+- coverage comparison:
+  [coverage_comparison_best_final_reeval.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/coverage_comparison_best_final_reeval.png)
+- visualization summary:
+  [best_final_reeval_visualization_summary.yaml](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_reeval_20260504_185530/best_final_reeval_visualization_summary.yaml)
 
 One important caveat from the sampled visualization RX: the best checkpoint
 still underperforms the phase-gradient reflector on some local hard-user

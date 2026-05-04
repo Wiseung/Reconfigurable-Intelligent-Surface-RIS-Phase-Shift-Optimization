@@ -226,15 +226,35 @@ class SionnaRISEnv:
             rx_target=self._base_rx_position,
         )
 
+        self.current_rx_candidate_index: int | None = 0
         self.last_state: np.ndarray | None = None
         self.last_reward: float | None = None
 
-    def reset(self, reuse_rx_position: bool = False) -> np.ndarray:
+    @property
+    def blind_spot_candidates(self) -> np.ndarray:
+        """Return a defensive copy of the cached blind-spot candidates."""
+        return np.array(self._blind_spot_candidates, dtype=np.float32, copy=True)
+
+    @property
+    def num_available_blind_spot_candidates(self) -> int:
+        """Return the number of blind-spot candidates available for reset control."""
+        return int(len(self._blind_spot_candidates))
+
+    def reset(
+        self,
+        reuse_rx_position: bool = False,
+        candidate_index: int | None = None,
+    ) -> np.ndarray:
         """Reset the RIS and optionally resample the blind-zone RX position."""
         if not reuse_rx_position:
-            base = self._blind_spot_candidates[
-                int(self.rng.integers(0, len(self._blind_spot_candidates)))
-            ].copy()
+            if candidate_index is None:
+                candidate_index = int(self.rng.integers(0, len(self._blind_spot_candidates)))
+            if candidate_index < 0 or candidate_index >= len(self._blind_spot_candidates):
+                raise ValueError(
+                    f"`candidate_index` must be in [0, {len(self._blind_spot_candidates) - 1}], "
+                    f"received {candidate_index}."
+                )
+            base = self._blind_spot_candidates[int(candidate_index)].copy()
             jitter = self.rng.uniform(
                 low=[-self.rx_jitter_xy_m, -self.rx_jitter_xy_m, 0.0],
                 high=[self.rx_jitter_xy_m, self.rx_jitter_xy_m, 0.0],
@@ -242,6 +262,7 @@ class SionnaRISEnv:
             position = base + jitter
             position[2] = self.rx_height_m
             self.rx.position = position.tolist()
+            self.current_rx_candidate_index = int(candidate_index)
         else:
             position = np.array(self.rx.position, dtype=np.float32, copy=True)
             position[2] = self.rx_height_m
