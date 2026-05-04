@@ -62,6 +62,12 @@ Use the validated pilot configuration:
 /home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/.conda-py310/bin/python train_loop.py --config configs/pilot_cpu.yaml
 ```
 
+Use the current formal 48-episode mainline configuration:
+
+```bash
+/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/.conda-py310/bin/python train_loop.py --config configs/pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval.yaml
+```
+
 Use the default longer CPU-Sionna configuration:
 
 ```bash
@@ -75,6 +81,56 @@ Artifacts are written under `runs/` and include:
 - `training.log`
 - `tensorboard/` if TensorBoard is available
 - checkpoints and `final_agent.pt`
+
+## Current Mainline Result
+
+The current recommended formal pilot configuration is:
+
+- [configs/pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval.yaml](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/configs/pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval.yaml)
+
+This run keeps the more reliable `rx_block_episodes=2` schedule and adds:
+
+- exclusive hard-replay routing
+- actor-update gating on hard baseline gaps
+- deterministic evaluation every 2 episodes
+- automatic `best_eval_agent.pt` checkpoint capture
+
+Current best validated run:
+
+- run dir:
+  [runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_20260504_145046](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_20260504_145046)
+- best checkpoint:
+  [best_eval_agent.pt](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_20260504_145046/best_eval_agent.pt)
+
+Headline metrics from `episode_metrics.csv` and `metrics.jsonl`:
+
+- `avg_all = 9.285641`
+- `avg_tail10 = 8.577790`
+- `avg_tail5 = 8.686258`
+- `best_eval = 11.301114`
+- `last_eval = 11.301114`
+
+This slightly improves the previous `rx2` mainline best deterministic eval
+(`11.243512`) while preserving much better final reliability than the `rx3`
+branch, which reached higher training returns but collapsed on final
+deterministic evaluation.
+
+Generated evaluation artifacts for the current mainline run:
+
+- learning curve:
+  [learning_curve_best_eval_checkpoint.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_20260504_145046/learning_curve_best_eval_checkpoint.png)
+- phase profile:
+  [phase_profile_best_eval_checkpoint.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_20260504_145046/phase_profile_best_eval_checkpoint.png)
+- coverage comparison:
+  [coverage_comparison_best_eval_checkpoint.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_20260504_145046/coverage_comparison_best_eval_checkpoint.png)
+- visualization summary:
+  [best_eval_visualization_summary.yaml](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_20260504_145046/best_eval_visualization_summary.yaml)
+
+One important caveat from the sampled visualization RX: the best checkpoint
+still underperforms the phase-gradient reflector on some local hard-user
+positions. That matches the run-level observation that average deterministic
+performance improved, but the hardest blind-spot realizations are not yet fully
+solved.
 
 ## Documentation
 

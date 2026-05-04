@@ -22,9 +22,12 @@ agent:
   hidden_dim: 512
   batch_size: 64
   replay_capacity: 10000
-  prioritized_replay: true
-  replay_priority_alpha: 0.8
-  replay_uniform_ratio: 0.20
+  dual_replay: true
+  hard_replay_capacity: 4000
+  hard_replay_ratio: 0.25
+  prioritized_replay: false
+  replay_priority_alpha: 1.0
+  replay_uniform_ratio: 0.0
   replay_priority_epsilon: 0.001
   actor_lr: 0.0003
   critic_lr: 0.0003
@@ -60,8 +63,10 @@ train:
   reward_margin_positive_weight: 0.20
   reward_margin_negative_weight: 0.50
   reward_baseline_key: phase_gradient_reflector_rate
-  hard_step_priority_scale: 0.35
-  hard_block_priority_scale: 0.80
+  hard_replay_step_gap_threshold: 2.0
+  hard_replay_block_gap_threshold: 2.5
+  hard_step_priority_scale: 0.0
+  hard_block_priority_scale: 0.0
   hard_priority_max: 8.0
 
 logging:

@@ -94,6 +94,56 @@ Once the pilot is stable:
 - optionally increase `path_num_samples`
 - keep `tf_device: cpu` unless TensorFlow/Sionna versions are upgraded to a stack that natively supports the GPU without PTX JIT
 
+### 4. Current formal pilot line
+
+Use [configs/pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval.yaml](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/configs/pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval.yaml).
+
+This is the current recommended mainline because it balances three things
+better than the other branches we tested:
+
+- deterministic final evaluation quality
+- stability on the more reliable `rx_block_episodes=2` schedule
+- explicit checkpoint retention based on `eval_avg_reward`
+
+Key mechanisms enabled in this config:
+
+- `hard_replay_route_mode: exclusive`
+- `hard_actor_update_gap_threshold: 4.0`
+- `hard_actor_policy_delay: 6`
+- `eval_every_episodes: 2`
+- `save_best_eval_checkpoint: true`
+- `best_eval_metric: eval_avg_reward`
+
+Recommended command:
+
+```bash
+/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/.conda-py310/bin/python train_loop.py --config configs/pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval.yaml
+```
+
+Current best validated run:
+
+- run dir:
+  [runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_20260504_145046](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_20260504_145046)
+- best checkpoint:
+  [best_eval_agent.pt](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_20260504_145046/best_eval_agent.pt)
+
+Measured summary:
+
+- `avg_all = 9.285641`
+- `avg_tail10 = 8.577790`
+- `avg_tail5 = 8.686258`
+- `best_eval = 11.301114`
+- `last_eval = 11.301114`
+
+Interpretation:
+
+- This line is slightly stronger than the older `rx2` baseline on best
+  deterministic eval (`11.301114` vs `11.243512`).
+- The `rx3` line still produces higher training averages and tail training
+  rewards, but it remains weaker on final deterministic generalization.
+- Best-checkpoint capture should now be treated as part of the standard run
+  protocol, not an optional add-on.
+
 ## Known Runtime Signals
 
 Expected:
@@ -152,6 +202,23 @@ These outputs are the intended inputs for:
 - `plot_learning_curve()`
 - `plot_phase_profile()`
 - `plot_coverage_comparison()`
+
+For the current formal mainline run, the generated report-ready figures are:
+
+- [learning_curve_best_eval_checkpoint.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_20260504_145046/learning_curve_best_eval_checkpoint.png)
+- [phase_profile_best_eval_checkpoint.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_20260504_145046/phase_profile_best_eval_checkpoint.png)
+- [coverage_comparison_best_eval_checkpoint.png](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_20260504_145046/coverage_comparison_best_eval_checkpoint.png)
+- [best_eval_visualization_summary.yaml](/home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_cpu_48ep_hard_replay_exclusive_actor_gate_best_eval_20260504_145046/best_eval_visualization_summary.yaml)
+
+The saved visualization summary also records one representative sampled blind
+spot RX where:
+
+- `no_ris_rate = 5.635887`
+- `phase_gradient_reflector_rate = 11.535450`
+- `best_eval_policy_rate_at_sampled_rx = 5.263661`
+
+This is a useful reminder that run-level average improvements and local hard-RX
+performance are not yet the same thing in the current environment.
 
 ## Experimental Caveat
 

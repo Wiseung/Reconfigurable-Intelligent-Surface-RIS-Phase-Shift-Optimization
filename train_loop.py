@@ -61,6 +61,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "init_alpha": 0.2,
         "batch_size": 128,
         "replay_capacity": 20000,
+        "dual_replay": False,
+        "hard_replay_capacity": None,
+        "hard_replay_ratio": 0.25,
         "prioritized_replay": False,
         "replay_priority_alpha": 1.0,
         "replay_uniform_ratio": 0.0,
@@ -85,7 +88,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "collection_deterministic_prob_end": 0.0,
         "collection_deterministic_prob_decay_steps": 1024,
         "collection_deterministic_noise_std": 0.0,
+        "late_collection_deterministic_prob_start_episode": None,
+        "late_collection_deterministic_prob_value": None,
         "policy_delay": 1,
+        "hard_actor_update_gap_threshold": None,
+        "hard_actor_policy_delay": None,
+        "hard_actor_min_observations": 1,
+        "freeze_actor_after_episode": None,
         "rx_block_episodes": 1,
         "rx_block_episodes_start": None,
         "rx_block_episodes_end": None,
@@ -95,10 +104,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "deterministic_eval": False,
         "eval_every_episodes": 5,
         "eval_num_episodes": 2,
+        "save_best_eval_checkpoint": False,
+        "best_eval_metric": "eval_avg_reward",
         "reward_margin_weight": 0.0,
         "reward_margin_positive_weight": None,
         "reward_margin_negative_weight": None,
         "reward_baseline_key": "phase_gradient_reflector_rate",
+        "hard_replay_route_mode": "duplicate",
+        "hard_replay_step_gap_threshold": None,
+        "hard_replay_block_gap_threshold": None,
         "hard_step_priority_scale": 0.0,
         "hard_block_priority_scale": 0.0,
         "hard_priority_max": 10.0,
@@ -202,6 +216,7 @@ def sample_action_for_env(
     global_step: int,
     train_cfg: dict[str, Any],
     *,
+    episode: int | None = None,
     deterministic: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
     """Follow the required bridge: NumPy state -> Torch action -> NumPy env action."""
@@ -248,6 +263,15 @@ def sample_action_for_env(
             step=schedule_step,
             decay_steps=int(train_cfg.get("collection_deterministic_prob_decay_steps", 1)),
         )
+        late_start_episode = train_cfg.get(
+            "late_collection_deterministic_prob_start_episode",
+            None,
+        )
+        late_value = train_cfg.get("late_collection_deterministic_prob_value", None)
+        if late_start_episode is not None and late_value is not None:
+            current_episode = 0 if episode is None else int(episode)
+            if current_episode >= int(late_start_episode):
+                deterministic_prob = float(late_value)
         deterministic_prob = float(np.clip(deterministic_prob, 0.0, 1.0))
         use_deterministic_collection = bool(np.random.random() < deterministic_prob)
 
@@ -317,6 +341,18 @@ def _resolve_rx_block_episodes(
     return start_block if int(episode) < transition_episode else end_block
 
 
+def should_freeze_actor_for_episode(
+    train_cfg: dict[str, Any],
+    *,
+    episode: int,
+) -> bool:
+    """Return whether actor updates should be disabled for the current episode."""
+    freeze_after_episode = train_cfg.get("freeze_actor_after_episode", None)
+    if freeze_after_episode is None:
+        return False
+    return int(episode) >= int(freeze_after_episode)
+
+
 def _resolve_reward_baseline(
     baselines: dict[str, float | None],
     train_cfg: dict[str, Any],
@@ -368,6 +404,57 @@ def compute_transition_priority(
     priority += float(train_cfg.get("hard_block_priority_scale", 0.0)) * block_gap
     priority_max = float(train_cfg.get("hard_priority_max", 10.0))
     return float(np.clip(priority, 1e-6, priority_max))
+
+
+def should_store_hard_transition(
+    *,
+    step_margin: float | None,
+    episode_margin: float | None,
+    train_cfg: dict[str, Any],
+) -> bool:
+    """Decide whether a transition should be duplicated into the hard replay pool."""
+    step_gap = 0.0 if step_margin is None else max(-float(step_margin), 0.0)
+    block_gap = 0.0 if episode_margin is None else max(-float(episode_margin), 0.0)
+    step_threshold = train_cfg.get("hard_replay_step_gap_threshold", None)
+    block_threshold = train_cfg.get("hard_replay_block_gap_threshold", None)
+
+    step_hard = False if step_threshold is None else step_gap >= float(step_threshold)
+    block_hard = False if block_threshold is None else block_gap >= float(block_threshold)
+    return bool(step_hard or block_hard)
+
+
+def resolve_hard_replay_route_mode(train_cfg: dict[str, Any]) -> str:
+    """Normalize the routing mode used by dual replay."""
+    route_mode = str(train_cfg.get("hard_replay_route_mode", "duplicate")).strip().lower()
+    if route_mode not in {"duplicate", "exclusive"}:
+        raise ValueError(
+            "`train.hard_replay_route_mode` must be either 'duplicate' or 'exclusive'."
+        )
+    return route_mode
+
+
+def resolve_actor_update_gate(
+    train_cfg: dict[str, Any],
+    *,
+    online_hard_gap: float,
+    num_observations: int,
+) -> tuple[int, bool]:
+    """Resolve the effective actor-update delay for the current training context."""
+    base_delay = max(1, int(train_cfg.get("policy_delay", 1)))
+    hard_delay_value = train_cfg.get("hard_actor_policy_delay", None)
+    gap_threshold = train_cfg.get("hard_actor_update_gap_threshold", None)
+    min_observations = max(1, int(train_cfg.get("hard_actor_min_observations", 1)))
+
+    if hard_delay_value is None or gap_threshold is None:
+        return base_delay, False
+    if num_observations < min_observations:
+        return base_delay, False
+
+    hard_delay = max(base_delay, int(hard_delay_value))
+    gate_active = float(online_hard_gap) >= float(gap_threshold)
+    if not gate_active:
+        return base_delay, False
+    return hard_delay, True
 
 
 def maybe_evaluate_episode_baselines(
@@ -556,9 +643,14 @@ def train(config_path: str | Path = "config.yaml") -> Path:
     )
 
     train_cfg = config["train"]
+    dual_replay_enabled = bool(config["agent"].get("dual_replay", False))
+    hard_replay_route_mode = resolve_hard_replay_route_mode(train_cfg)
     global_step = 0
     gradient_step = 0
+    actor_update_wait = 0
     total_episodes = int(train_cfg["num_episodes"])
+    best_eval_metric_name = str(train_cfg.get("best_eval_metric", "eval_avg_reward"))
+    best_eval_metric_value: float | None = None
 
     for episode in range(1, total_episodes + 1):
         rx_block_episodes = _resolve_rx_block_episodes(
@@ -576,7 +668,11 @@ def train(config_path: str | Path = "config.yaml") -> Path:
         episode_baseline_reference = _resolve_reward_baseline(episode_baselines, train_cfg)
         episode_reward = 0.0
         episode_shaped_reward = 0.0
+        hard_replay_added = 0
         episode_transition_records: list[tuple[int, float | None]] = []
+        episode_transition_payloads: list[dict[str, Any]] = []
+        episode_hard_gap_sum = 0.0
+        episode_hard_gap_count = 0
         loss_accumulator: dict[str, list[float]] = {
             "actor_loss": [],
             "critic_loss": [],
@@ -589,6 +685,9 @@ def train(config_path: str | Path = "config.yaml") -> Path:
             "collection_deterministic_prob": [],
             "exploration_scale": [],
             "action_noise_std": [],
+            "effective_policy_delay": [],
+            "actor_gate_active": [],
+            "online_hard_step_gap": [],
         }
 
         for step_idx in range(1, int(train_cfg["max_steps_per_episode"]) + 1):
@@ -599,6 +698,7 @@ def train(config_path: str | Path = "config.yaml") -> Path:
                 warmup=warmup,
                 global_step=global_step,
                 train_cfg=train_cfg,
+                episode=episode,
             )
             next_state, raw_reward = env.step(env_action)
             done = step_idx >= int(train_cfg["max_steps_per_episode"])
@@ -607,27 +707,55 @@ def train(config_path: str | Path = "config.yaml") -> Path:
                 baselines=episode_baselines,
                 train_cfg=train_cfg,
             )
+            hard_step_gap = 0.0 if reward_margin is None else max(-float(reward_margin), 0.0)
+            episode_hard_gap_sum += hard_step_gap
+            episode_hard_gap_count += 1
+            online_hard_gap = episode_hard_gap_sum / max(episode_hard_gap_count, 1)
 
             transition_priority = compute_transition_priority(
                 step_margin=reward_margin,
                 episode_margin=None,
                 train_cfg=train_cfg,
             )
-            replay_index = agent.store_transition(
-                state,
-                grouped_action,
-                shaped_reward,
-                next_state,
-                done,
-                priority=transition_priority,
+            episode_transition_payloads.append(
+                {
+                    "state": np.asarray(state, dtype=np.float32).copy(),
+                    "grouped_action": np.asarray(grouped_action, dtype=np.float32).copy(),
+                    "reward": float(shaped_reward),
+                    "next_state": np.asarray(next_state, dtype=np.float32).copy(),
+                    "done": bool(done),
+                    "step_margin": reward_margin,
+                }
             )
-            episode_transition_records.append((replay_index, reward_margin))
+            if not (dual_replay_enabled and hard_replay_route_mode == "exclusive"):
+                replay_index = agent.store_transition(
+                    state,
+                    grouped_action,
+                    shaped_reward,
+                    next_state,
+                    done,
+                    priority=transition_priority,
+                )
+                episode_transition_records.append((replay_index, reward_margin))
 
             if agent.ready():
                 for _ in range(int(train_cfg["updates_per_step"])):
                     gradient_step += 1
-                    policy_delay = max(1, int(train_cfg.get("policy_delay", 1)))
-                    update_actor = (gradient_step % policy_delay) == 0
+                    actor_frozen = should_freeze_actor_for_episode(
+                        train_cfg,
+                        episode=episode,
+                    )
+                    effective_policy_delay, actor_gate_active = resolve_actor_update_gate(
+                        train_cfg,
+                        online_hard_gap=online_hard_gap,
+                        num_observations=episode_hard_gap_count,
+                    )
+                    actor_update_wait += 1
+                    update_actor = actor_update_wait >= effective_policy_delay
+                    if update_actor:
+                        actor_update_wait = 0
+                    if actor_frozen:
+                        update_actor = False
                     losses = agent.update(
                         update_actor=update_actor,
                         update_alpha=update_actor,
@@ -636,6 +764,11 @@ def train(config_path: str | Path = "config.yaml") -> Path:
                     for key, value in losses.items():
                         if value is not None:
                             loss_accumulator[key].append(value)
+                    loss_accumulator["effective_policy_delay"].append(
+                        float(effective_policy_delay)
+                    )
+                    loss_accumulator["actor_gate_active"].append(float(actor_gate_active))
+                    loss_accumulator["online_hard_step_gap"].append(float(online_hard_gap))
 
             state = next_state
             episode_reward += float(raw_reward)
@@ -654,7 +787,47 @@ def train(config_path: str | Path = "config.yaml") -> Path:
         episode_margin = None
         if episode_baseline_reference is not None:
             episode_margin = (episode_reward / max(steps_this_episode, 1)) - episode_baseline_reference
-        if episode_transition_records and (
+        if dual_replay_enabled and episode_transition_payloads:
+            for payload in episode_transition_payloads:
+                is_hard = should_store_hard_transition(
+                    step_margin=payload["step_margin"],
+                    episode_margin=episode_margin,
+                    train_cfg=train_cfg,
+                )
+                transition_priority = compute_transition_priority(
+                    step_margin=payload["step_margin"],
+                    episode_margin=episode_margin,
+                    train_cfg=train_cfg,
+                )
+                if hard_replay_route_mode == "exclusive":
+                    if is_hard:
+                        agent.store_hard_transition(
+                            payload["state"],
+                            payload["grouped_action"],
+                            payload["reward"],
+                            payload["next_state"],
+                            payload["done"],
+                        )
+                        hard_replay_added += 1
+                    else:
+                        agent.store_transition(
+                            payload["state"],
+                            payload["grouped_action"],
+                            payload["reward"],
+                            payload["next_state"],
+                            payload["done"],
+                            priority=transition_priority,
+                        )
+                elif is_hard:
+                    agent.store_hard_transition(
+                        payload["state"],
+                        payload["grouped_action"],
+                        payload["reward"],
+                        payload["next_state"],
+                        payload["done"],
+                    )
+                    hard_replay_added += 1
+        elif episode_transition_records and (
             float(train_cfg.get("hard_step_priority_scale", 0.0)) > 0.0
             or float(train_cfg.get("hard_block_priority_scale", 0.0)) > 0.0
         ):
@@ -694,6 +867,7 @@ def train(config_path: str | Path = "config.yaml") -> Path:
             if episode_baseline_reference is None
             else avg_reward - episode_baseline_reference,
             "avg_hard_block_gap": None if episode_margin is None else max(-episode_margin, 0.0),
+            "hard_replay_added": hard_replay_added,
             "episode_no_ris_rate": episode_baselines.get("no_ris_rate"),
             "episode_phase_gradient_reflector_rate": episode_baselines.get(
                 "phase_gradient_reflector_rate"
@@ -714,6 +888,11 @@ def train(config_path: str | Path = "config.yaml") -> Path:
             ),
             "avg_exploration_scale": _safe_mean(loss_accumulator["exploration_scale"]),
             "avg_action_noise_std": _safe_mean(loss_accumulator["action_noise_std"]),
+            "avg_effective_policy_delay": _safe_mean(
+                loss_accumulator["effective_policy_delay"]
+            ),
+            "avg_actor_gate_active": _safe_mean(loss_accumulator["actor_gate_active"]),
+            "avg_online_hard_step_gap": _safe_mean(loss_accumulator["online_hard_step_gap"]),
             "rx_block_episodes": rx_block_episodes,
             "rx_reused": float(reuse_rx_position),
             **eval_summary,
@@ -732,6 +911,25 @@ def train(config_path: str | Path = "config.yaml") -> Path:
         append_metrics_jsonl(metrics_path, {"type": "episode", **summary})
         append_metrics_csv(csv_path, summary)
         maybe_write_tensorboard(writer, summary, step=episode)
+
+        if bool(train_cfg.get("save_best_eval_checkpoint", False)):
+            candidate_metric = summary.get(best_eval_metric_name)
+            if candidate_metric is not None:
+                candidate_metric = float(candidate_metric)
+                if best_eval_metric_value is None or candidate_metric > best_eval_metric_value:
+                    best_eval_metric_value = candidate_metric
+                    best_checkpoint_path = run_dir / "best_eval_agent.pt"
+                    agent.save(str(best_checkpoint_path))
+                    append_metrics_jsonl(
+                        metrics_path,
+                        {
+                            "type": "best_eval_checkpoint",
+                            "episode": episode,
+                            "metric_name": best_eval_metric_name,
+                            "metric_value": best_eval_metric_value,
+                            "checkpoint_path": str(best_checkpoint_path),
+                        },
+                    )
 
         checkpoint_every = int(train_cfg["checkpoint_every"])
         if checkpoint_every > 0 and episode % checkpoint_every == 0:

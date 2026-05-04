@@ -45,6 +45,9 @@ class SACConfig:
     init_alpha: float = 0.2
     batch_size: int = 128
     replay_capacity: int = 20000
+    dual_replay: bool = False
+    hard_replay_capacity: int | None = None
+    hard_replay_ratio: float = 0.25
     prioritized_replay: bool = False
     replay_priority_alpha: float = 1.0
     replay_uniform_ratio: float = 0.0
@@ -432,6 +435,21 @@ class SACAgent:
             uniform_ratio=config.replay_uniform_ratio,
             priority_epsilon=config.replay_priority_epsilon,
         )
+        self.dual_replay = bool(config.dual_replay)
+        self.hard_replay_ratio = float(np.clip(config.hard_replay_ratio, 0.0, 1.0))
+        self.hard_replay_buffer: ReplayBuffer | None = None
+        if self.dual_replay:
+            hard_replay_capacity = (
+                int(config.hard_replay_capacity)
+                if config.hard_replay_capacity is not None
+                else max(config.batch_size * 8, config.replay_capacity // 2)
+            )
+            self.hard_replay_buffer = ReplayBuffer(
+                state_dim=config.state_dim,
+                action_dim=config.grouped_action_dim,
+                capacity=hard_replay_capacity,
+                prioritized=False,
+            )
 
     @property
     def alpha(self) -> torch.Tensor:
@@ -530,6 +548,25 @@ class SACAgent:
     ) -> None:
         self.replay_buffer.update_priorities(indices, priorities)
 
+    def store_hard_transition(
+        self,
+        state: np.ndarray,
+        grouped_action: np.ndarray,
+        reward: float,
+        next_state: np.ndarray,
+        done: bool,
+    ) -> int | None:
+        if self.hard_replay_buffer is None:
+            return None
+        return self.hard_replay_buffer.add(
+            state,
+            grouped_action,
+            reward,
+            next_state,
+            done,
+            priority=1.0,
+        )
+
     def ready(self) -> bool:
         return len(self.replay_buffer) >= self.config.batch_size
 
@@ -551,7 +588,7 @@ class SACAgent:
         if update_target is None:
             update_target = update_actor
 
-        batch = self.replay_buffer.sample(self.config.batch_size, self.device)
+        batch = self._sample_training_batch()
         states = batch["states"]
         actions = batch["actions"]
         rewards = batch["rewards"]
@@ -653,3 +690,26 @@ class SACAgent:
                 self.log_alpha.data.clamp_(min=self.log_alpha_min)
             if self.log_alpha_max is not None:
                 self.log_alpha.data.clamp_(max=self.log_alpha_max)
+
+    def _sample_training_batch(self) -> dict[str, torch.Tensor]:
+        if not self.dual_replay or self.hard_replay_buffer is None or len(self.hard_replay_buffer) == 0:
+            return self.replay_buffer.sample(self.config.batch_size, self.device)
+
+        hard_batch_size = int(round(self.config.batch_size * self.hard_replay_ratio))
+        hard_batch_size = min(hard_batch_size, len(self.hard_replay_buffer), self.config.batch_size)
+        normal_batch_size = self.config.batch_size - hard_batch_size
+
+        if normal_batch_size <= 0:
+            return self.hard_replay_buffer.sample(self.config.batch_size, self.device)
+
+        normal_batch = self.replay_buffer.sample(normal_batch_size, self.device)
+        if hard_batch_size == 0:
+            return normal_batch
+
+        hard_batch = self.hard_replay_buffer.sample(hard_batch_size, self.device)
+        merged = {
+            key: torch.cat([normal_batch[key], hard_batch[key]], dim=0)
+            for key in normal_batch
+        }
+        permutation = torch.randperm(self.config.batch_size, device=self.device)
+        return {key: value[permutation] for key, value in merged.items()}
