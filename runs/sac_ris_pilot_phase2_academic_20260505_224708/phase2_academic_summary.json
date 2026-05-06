@@ -1,0 +1,121 @@
+{
+  "run_dir": "runs/sac_ris_pilot_phase2_academic_20260505_224708",
+  "figure_path": "runs/sac_ris_pilot_phase2_academic_20260505_224708/academic_learning_curve.png",
+  "num_episodes": 12,
+  "zone_counts": {
+    "los": 8,
+    "nlos": 4
+  },
+  "train_reward_mean": 15.774046253675612,
+  "train_reward_max": 18.855930828532227,
+  "train_reward_min": 10.815988219469993,
+  "shaped_reward_mean": 15.944846383945773,
+  "eval_reward_mean": 14.058619346572298,
+  "eval_reward_max": 18.698920415275033,
+  "baseline": {
+    "type": "baseline",
+    "timestamp": "2026-05-05T22:47:23.496201",
+    "no_ris_rate": 10.905167137902595,
+    "phase_gradient_reflector_rate": 9.65341745640343
+  },
+  "baseline_fixed_positions": {
+    "type": "baseline_fixed_positions",
+    "timestamp": "2026-05-05T22:47:23.496301",
+    "overall": {
+      "no_ris_rate_mean": 14.192500420888683,
+      "phase_gradient_reflector_rate_mean": 14.754550646081775
+    },
+    "zones": {
+      "los": {
+        "num_candidates": 4,
+        "no_ris_rate_mean": 17.461060102607576,
+        "phase_gradient_reflector_rate_mean": 17.536344453376195,
+        "candidates": [
+          {
+            "candidate_index": 0,
+            "rx_x_m": -118.0,
+            "rx_y_m": 6.0,
+            "rx_z_m": 1.5,
+            "no_ris_rate": 18.66043102896599,
+            "phase_gradient_reflector_rate": 18.66043102896599
+          },
+          {
+            "candidate_index": 1,
+            "rx_x_m": -86.0,
+            "rx_y_m": -10.0,
+            "rx_z_m": 1.5,
+            "no_ris_rate": 17.322305143532393,
+            "phase_gradient_reflector_rate": 17.623442838819837
+          },
+          {
+            "candidate_index": 2,
+            "rx_x_m": -102.0,
+            "rx_y_m": -10.0,
+            "rx_z_m": 1.5,
+            "no_ris_rate": 16.88543579972551,
+            "phase_gradient_reflector_rate": 16.88543579972551
+          },
+          {
+            "candidate_index": 3,
+            "rx_x_m": -134.0,
+            "rx_y_m": 6.0,
+            "rx_z_m": 1.5,
+            "no_ris_rate": 16.976068438206415,
+            "phase_gradient_reflector_rate": 16.976068145993445
+          }
+        ]
+      },
+      "nlos": {
+        "num_candidates": 4,
+        "no_ris_rate_mean": 10.92394073916979,
+        "phase_gradient_reflector_rate_mean": 11.972756838787355,
+        "candidates": [
+          {
+            "candidate_index": 0,
+            "rx_x_m": -46.0,
+            "rx_y_m": 126.0,
+            "rx_z_m": 1.5,
+            "no_ris_rate": 10.723231282248989,
+            "phase_gradient_reflector_rate": 13.03838737585608
+          },
+          {
+            "candidate_index": 1,
+            "rx_x_m": -6.0,
+            "rx_y_m": 118.0,
+            "rx_z_m": 1.5,
+            "no_ris_rate": 10.817221297183325,
+            "phase_gradient_reflector_rate": 8.855701815225334
+          },
+          {
+            "candidate_index": 2,
+            "rx_x_m": -46.0,
+            "rx_y_m": 86.0,
+            "rx_z_m": 1.5,
+            "no_ris_rate": 10.860222659467768,
+            "phase_gradient_reflector_rate": 12.602676819558072
+          },
+          {
+            "candidate_index": 3,
+            "rx_x_m": -14.0,
+            "rx_y_m": 86.0,
+            "rx_z_m": 1.5,
+            "no_ris_rate": 11.295087717779081,
+            "phase_gradient_reflector_rate": 13.394261344509935
+          }
+        ]
+      }
+    }
+  },
+  "recommended_checkpoint": {
+    "type": "recommended_checkpoint",
+    "checkpoint_path": "runs/sac_ris_pilot_phase2_academic_20260505_224708/recommended_agent.pt",
+    "checkpoint_source": "final_checkpoint_reeval"
+  },
+  "final_checkpoint_reeval": null,
+  "academic_curve": {
+    "best_smoothed_reward": 18.698920415275033,
+    "no_ris_baseline": 14.192500420888683,
+    "reflector_baseline": 14.754550646081775,
+    "improvement_over_reflector_percent": 26.733242264078893
+  }
+}

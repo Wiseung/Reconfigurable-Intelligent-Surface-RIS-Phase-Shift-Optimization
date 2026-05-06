@@ -46,6 +46,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "blind_spot_cell_size": [8.0, 8.0],
         "num_blind_spot_candidates": 16,
         "require_native_ris": True,
+        "discrete_phase": False,
+        "num_bits": 2,
+        "mobility_enabled": False,
+        "zone_spawn_mode": "all",
     },
     "agent": {
         "grouped_rows": 10,
@@ -102,16 +106,28 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "hard_rx_focus_enabled": False,
         "hard_rx_focus_start_episode": 1,
         "hard_rx_focus_end_episode": None,
+        "hard_rx_focus_zone": "nlos",
         "hard_rx_focus_probability": 0.5,
         "hard_rx_focus_gap_power": 1.0,
         "hard_rx_focus_min_gap": 0.25,
         "hard_rx_focus_warmup_episodes": 0,
+        "hard_rx_focus_bootstrap_min_observations": 0,
+        "hard_rx_focus_priority_zone": None,
+        "hard_rx_focus_priority_candidate": None,
+        "hard_rx_focus_priority_start_episode": None,
+        "hard_rx_focus_priority_end_episode": None,
+        "hard_rx_focus_priority_min_observations": 0,
+        "hard_rx_focus_priority_weight_boost": 1.0,
         "hard_rx_priority_scale": 0.0,
         "updates_per_step": 1,
         "checkpoint_every": 10,
         "deterministic_eval": False,
         "eval_every_episodes": 5,
         "eval_num_episodes": 2,
+        "eval_zone_name": "all",
+        "zone_aware_eval_enabled": False,
+        "zone_aware_eval_zones": ["los", "nlos"],
+        "zone_aware_eval_num_episodes": None,
         "save_best_eval_checkpoint": False,
         "best_eval_metric": "eval_avg_reward",
         "final_checkpoint_reeval_enabled": False,
@@ -123,6 +139,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "reward_margin_weight": 0.0,
         "reward_margin_positive_weight": None,
         "reward_margin_negative_weight": None,
+        "reward_margin_positive_weight_los": None,
+        "reward_margin_negative_weight_los": None,
+        "reward_margin_positive_weight_nlos": None,
+        "reward_margin_negative_weight_nlos": None,
         "reward_baseline_key": "phase_gradient_reflector_rate",
         "hard_replay_route_mode": "duplicate",
         "hard_replay_step_gap_threshold": None,
@@ -213,6 +233,85 @@ def evaluate_baselines(env: SionnaRISEnv) -> dict[str, float | None]:
         "no_ris_rate": float(env.evaluate_no_ris_rate()),
         "phase_gradient_reflector_rate": env.evaluate_phase_gradient_reflector_rate(),
     }
+
+
+def evaluate_fixed_position_baselines(
+    env: SionnaRISEnv,
+    *,
+    zone_name: str | None = None,
+    candidate_index: int | None = None,
+) -> dict[str, float | None]:
+    """Evaluate no-RIS and reflector baselines on one exact RX realization."""
+    snapshot = _snapshot_env_state(env)
+    try:
+        env.reset(
+            reuse_rx_position=False,
+            candidate_index=candidate_index,
+            zone_name=zone_name,
+        )
+        return {
+            "no_ris_rate": float(env.evaluate_no_ris_rate()),
+            "phase_gradient_reflector_rate": env.evaluate_phase_gradient_reflector_rate(),
+        }
+    finally:
+        _restore_env_state(env, snapshot)
+
+
+def collect_formal_baselines(env: SionnaRISEnv) -> dict[str, Any]:
+    """Collect exact-position baselines for all exposed zone candidate pools."""
+    zone_candidates = getattr(env, "zone_candidates", {})
+    payload: dict[str, Any] = {
+        "overall": {
+            "no_ris_rate_mean": None,
+            "phase_gradient_reflector_rate_mean": None,
+        },
+        "zones": {},
+    }
+    all_no_ris: list[float] = []
+    all_reflector: list[float] = []
+    for zone_name, candidates in zone_candidates.items():
+        rows: list[dict[str, Any]] = []
+        for candidate_index, candidate in enumerate(np.asarray(candidates, dtype=np.float32)):
+            baselines = evaluate_fixed_position_baselines(
+                env,
+                zone_name=zone_name,
+                candidate_index=int(candidate_index),
+            )
+            rows.append(
+                {
+                    "candidate_index": int(candidate_index),
+                    "rx_x_m": float(candidate[0]),
+                    "rx_y_m": float(candidate[1]),
+                    "rx_z_m": float(candidate[2]),
+                    "no_ris_rate": _maybe_float_value(baselines.get("no_ris_rate")),
+                    "phase_gradient_reflector_rate": _maybe_float_value(
+                        baselines.get("phase_gradient_reflector_rate")
+                    ),
+                }
+            )
+        zone_no_ris = [row["no_ris_rate"] for row in rows if row["no_ris_rate"] is not None]
+        zone_reflector = [
+            row["phase_gradient_reflector_rate"]
+            for row in rows
+            if row["phase_gradient_reflector_rate"] is not None
+        ]
+        all_no_ris.extend(zone_no_ris)
+        all_reflector.extend(zone_reflector)
+        payload["zones"][zone_name] = {
+            "num_candidates": len(rows),
+            "no_ris_rate_mean": None if not zone_no_ris else float(np.mean(zone_no_ris)),
+            "phase_gradient_reflector_rate_mean": None
+            if not zone_reflector
+            else float(np.mean(zone_reflector)),
+            "candidates": rows,
+        }
+    payload["overall"] = {
+        "no_ris_rate_mean": None if not all_no_ris else float(np.mean(all_no_ris)),
+        "phase_gradient_reflector_rate_mean": None
+        if not all_reflector
+        else float(np.mean(all_reflector)),
+    }
+    return payload
 
 
 def state_numpy_to_torch(state: np.ndarray, device: torch.device) -> torch.Tensor:
@@ -355,17 +454,37 @@ def _resolve_rx_block_episodes(
     return start_block if int(episode) < transition_episode else end_block
 
 
-def initialize_hard_rx_stats(env) -> dict[int, dict[str, float]]:
-    """Create per-candidate hard-RX statistics for blind-spot focused sampling."""
-    candidate_count = int(getattr(env, "num_available_blind_spot_candidates", 0))
-    return {
-        idx: {
-            "episodes": 0.0,
-            "avg_gap": 0.0,
-            "last_gap": 0.0,
-        }
-        for idx in range(candidate_count)
-    }
+def initialize_hard_rx_stats(env) -> dict[str, dict[str, float]]:
+    """Create per-zone candidate stats for hard-example receiver sampling."""
+    hard_rx_stats: dict[str, dict[str, float]] = {}
+    zone_candidates = getattr(env, "zone_candidates", {})
+    if zone_candidates:
+        for zone_name, candidates in zone_candidates.items():
+            normalized_zone = _normalize_zone_name(zone_name)
+            if normalized_zone is None:
+                continue
+            for candidate_index in range(len(candidates)):
+                key = make_hard_rx_key(normalized_zone, candidate_index)
+                hard_rx_stats[key] = {
+                    "episodes": 0.0,
+                    "avg_gap": 0.0,
+                    "last_gap": 0.0,
+                }
+    if not hard_rx_stats:
+        candidate_count = int(getattr(env, "num_available_blind_spot_candidates", 0))
+        for candidate_index in range(candidate_count):
+            key = make_hard_rx_key("nlos", candidate_index)
+            hard_rx_stats[key] = {
+                "episodes": 0.0,
+                "avg_gap": 0.0,
+                "last_gap": 0.0,
+            }
+    return hard_rx_stats
+
+
+def make_hard_rx_key(zone_name: str, candidate_index: int) -> str:
+    """Build a stable key for one `(zone, candidate)` receiver block."""
+    return f"{zone_name}:{int(candidate_index)}"
 
 
 def select_rx_candidate_index(
@@ -374,59 +493,151 @@ def select_rx_candidate_index(
     train_cfg: dict[str, Any],
     episode: int,
     reuse_rx_position: bool,
-    hard_rx_stats: dict[int, dict[str, float]],
-) -> tuple[int | None, float, float]:
+    hard_rx_stats: dict[str, dict[str, float]],
+) -> tuple[str | None, int | None, float, float]:
     """Optionally bias sampling toward blind-spot candidates with larger historical gaps."""
     if reuse_rx_position:
-        return None, 0.0, 0.0
+        return None, None, 0.0, 0.0
     if not bool(train_cfg.get("hard_rx_focus_enabled", False)):
-        return None, 0.0, 0.0
+        return None, None, 0.0, 0.0
     if int(episode) < int(train_cfg.get("hard_rx_focus_start_episode", 1)):
-        return None, 0.0, 0.0
+        return None, None, 0.0, 0.0
     end_episode = train_cfg.get("hard_rx_focus_end_episode", None)
     if end_episode is not None and int(episode) > int(end_episode):
-        return None, 0.0, 0.0
+        return None, None, 0.0, 0.0
 
     warmup_episodes = max(0, int(train_cfg.get("hard_rx_focus_warmup_episodes", 0)))
+    zone_filter = _normalize_zone_name(train_cfg.get("hard_rx_focus_zone", "nlos"))
     eligible = [
-        idx
-        for idx, stats in hard_rx_stats.items()
+        key
+        for key, stats in hard_rx_stats.items()
         if stats["episodes"] >= warmup_episodes
+        and (zone_filter is None or key.startswith(f"{zone_filter}:"))
     ]
     if not eligible:
-        return None, 0.0, 0.0
+        eligible = [
+            key
+            for key, stats in hard_rx_stats.items()
+            if stats["episodes"] >= warmup_episodes
+        ]
+    if not eligible:
+        return None, None, 0.0, 0.0
+
+    eligible_keys = list(eligible)
+
+    priority_zone = _normalize_zone_name(train_cfg.get("hard_rx_focus_priority_zone", None))
+    priority_candidate = train_cfg.get("hard_rx_focus_priority_candidate", None)
+    priority_key = None
+    if priority_zone is not None and priority_candidate is not None:
+        try:
+            priority_key = make_hard_rx_key(priority_zone, int(priority_candidate))
+        except (TypeError, ValueError):
+            priority_key = None
+        if priority_key not in eligible_keys:
+            priority_key = None
+
+    priority_start_episode = train_cfg.get("hard_rx_focus_priority_start_episode", None)
+    priority_end_episode = train_cfg.get("hard_rx_focus_priority_end_episode", None)
+    priority_active = priority_key is not None
+    if priority_active and priority_start_episode is not None:
+        priority_active = int(episode) >= int(priority_start_episode)
+    if priority_active and priority_end_episode is not None:
+        priority_active = int(episode) <= int(priority_end_episode)
+    if not priority_active:
+        priority_key = None
+
+    priority_min_observations = max(
+        0,
+        int(train_cfg.get("hard_rx_focus_priority_min_observations", 0)),
+    )
+    if (
+        priority_key is not None
+        and priority_min_observations > 0
+        and float(hard_rx_stats[priority_key]["episodes"]) < float(priority_min_observations)
+    ):
+        priority_zone_name, priority_index_str = priority_key.split(":", maxsplit=1)
+        return (
+            priority_zone_name,
+            int(priority_index_str),
+            1.0,
+            float(hard_rx_stats[priority_key]["avg_gap"]),
+        )
+
+    bootstrap_min_observations = max(
+        0,
+        int(train_cfg.get("hard_rx_focus_bootstrap_min_observations", 0)),
+    )
+    if bootstrap_min_observations > 0:
+        bootstrap_keys = [
+            key
+            for key in eligible_keys
+            if float(hard_rx_stats[key]["episodes"]) < float(bootstrap_min_observations)
+        ]
+        if bootstrap_keys:
+            min_observations = min(float(hard_rx_stats[key]["episodes"]) for key in bootstrap_keys)
+            least_seen_keys = [
+                key
+                for key in bootstrap_keys
+                if float(hard_rx_stats[key]["episodes"]) == min_observations
+            ]
+            chosen_key = str(np.random.choice(least_seen_keys))
+            chosen_zone, chosen_index_str = chosen_key.split(":", maxsplit=1)
+            chosen_index = int(chosen_index_str)
+            return (
+                chosen_zone,
+                chosen_index,
+                1.0 / float(len(least_seen_keys)),
+                float(hard_rx_stats[chosen_key]["avg_gap"]),
+            )
 
     focus_probability = float(np.clip(train_cfg.get("hard_rx_focus_probability", 0.5), 0.0, 1.0))
     if np.random.random() >= focus_probability:
-        return None, 0.0, 0.0
+        return None, None, 0.0, 0.0
 
     min_gap = float(max(train_cfg.get("hard_rx_focus_min_gap", 0.0), 0.0))
     gap_power = float(max(train_cfg.get("hard_rx_focus_gap_power", 1.0), 1e-6))
     weights = []
-    for idx in eligible:
-        avg_gap = max(float(hard_rx_stats[idx]["avg_gap"]), 0.0)
+    priority_weight_boost = float(
+        max(train_cfg.get("hard_rx_focus_priority_weight_boost", 1.0), 1e-6)
+    )
+    for key in eligible_keys:
+        avg_gap = max(float(hard_rx_stats[key]["avg_gap"]), 0.0)
         weight = max(avg_gap, min_gap) ** gap_power
+        if priority_key is not None and key == priority_key:
+            weight *= priority_weight_boost
         weights.append(weight)
     weights_np = np.asarray(weights, dtype=np.float64)
     if not np.isfinite(weights_np).all() or float(np.sum(weights_np)) <= 0.0:
-        return None, 0.0, 0.0
+        return None, None, 0.0, 0.0
     probs = weights_np / float(np.sum(weights_np))
-    chosen_offset = int(np.random.choice(len(eligible), p=probs))
-    chosen_index = int(eligible[chosen_offset])
-    return chosen_index, float(probs[chosen_offset]), float(hard_rx_stats[chosen_index]["avg_gap"])
+    chosen_offset = int(np.random.choice(len(eligible_keys), p=probs))
+    chosen_key = str(eligible_keys[chosen_offset])
+    chosen_zone, chosen_index_str = chosen_key.split(":", maxsplit=1)
+    chosen_index = int(chosen_index_str)
+    return (
+        chosen_zone,
+        chosen_index,
+        float(probs[chosen_offset]),
+        float(hard_rx_stats[chosen_key]["avg_gap"]),
+    )
 
 
 def update_hard_rx_stats(
-    hard_rx_stats: dict[int, dict[str, float]],
+    hard_rx_stats: dict[str, dict[str, float]],
     *,
+    zone_name: str | None,
     candidate_index: int | None,
     episode_gap: float | None,
 ) -> None:
     """Update per-candidate average hard gap after one episode block."""
-    if candidate_index is None or candidate_index not in hard_rx_stats or episode_gap is None:
+    normalized_zone = _normalize_zone_name(zone_name)
+    if normalized_zone is None or candidate_index is None or episode_gap is None:
+        return
+    stats_key = make_hard_rx_key(normalized_zone, candidate_index)
+    if stats_key not in hard_rx_stats:
         return
     gap = max(float(episode_gap), 0.0)
-    stats = hard_rx_stats[candidate_index]
+    stats = hard_rx_stats[stats_key]
     episodes = int(stats["episodes"])
     new_count = episodes + 1
     stats["avg_gap"] = (float(stats["avg_gap"]) * episodes + gap) / float(new_count)
@@ -459,11 +670,43 @@ def _resolve_reward_baseline(
     return float(baseline)
 
 
+def _normalize_zone_name(zone_name: str | None) -> str | None:
+    if zone_name is None:
+        return None
+    normalized = str(zone_name).strip().lower()
+    if normalized in {"los", "nlos"}:
+        return normalized
+    return None
+
+
+def _resolve_zone_margin_weight(
+    train_cfg: dict[str, Any],
+    *,
+    margin_positive: bool,
+    current_zone: str | None,
+    default_weight: float,
+) -> float:
+    sign_key = "positive" if margin_positive else "negative"
+    normalized_zone = _normalize_zone_name(current_zone)
+    if normalized_zone is not None:
+        zone_key = f"reward_margin_{sign_key}_weight_{normalized_zone}"
+        zone_weight = train_cfg.get(zone_key, None)
+        if zone_weight is not None:
+            return float(zone_weight)
+
+    generic_key = f"reward_margin_{sign_key}_weight"
+    generic_weight = train_cfg.get(generic_key, None)
+    if generic_weight is not None:
+        return float(generic_weight)
+    return float(default_weight)
+
+
 def shape_reward(
     raw_reward: float,
     *,
     baselines: dict[str, float | None],
     train_cfg: dict[str, Any],
+    current_zone: str | None = None,
 ) -> tuple[float, float | None]:
     reward_margin_weight = float(train_cfg.get("reward_margin_weight", 0.0))
     baseline = _resolve_reward_baseline(baselines, train_cfg)
@@ -471,10 +714,18 @@ def shape_reward(
         return float(raw_reward), None
 
     margin = float(raw_reward) - baseline
-    positive_weight = train_cfg.get("reward_margin_positive_weight", None)
-    negative_weight = train_cfg.get("reward_margin_negative_weight", None)
-    positive_weight = reward_margin_weight if positive_weight is None else float(positive_weight)
-    negative_weight = reward_margin_weight if negative_weight is None else float(negative_weight)
+    positive_weight = _resolve_zone_margin_weight(
+        train_cfg,
+        margin_positive=True,
+        current_zone=current_zone,
+        default_weight=reward_margin_weight,
+    )
+    negative_weight = _resolve_zone_margin_weight(
+        train_cfg,
+        margin_positive=False,
+        current_zone=current_zone,
+        default_weight=reward_margin_weight,
+    )
 
     if margin >= 0.0:
         shaped_reward = float(raw_reward) + positive_weight * margin
@@ -600,6 +851,67 @@ def _restore_env_state(env, snapshot: dict[str, Any]) -> None:
     env.last_reward = snapshot.get("last_reward")
 
 
+def _run_eval_rollouts(
+    *,
+    env,
+    agent: SACAgent,
+    train_cfg: dict[str, Any],
+    baselines: dict[str, float | None],
+    eval_zone_name: str,
+    num_episodes: int,
+) -> dict[str, float | None]:
+    max_steps = int(train_cfg["max_steps_per_episode"])
+    raw_episode_rewards: list[float] = []
+    shaped_episode_rewards: list[float] = []
+    reward_margins: list[float] = []
+
+    for _ in range(max(1, int(num_episodes))):
+        state = env.reset(zone_name=eval_zone_name)
+        episode_baselines = maybe_evaluate_episode_baselines(
+            env,
+            train_cfg=train_cfg,
+            fallback_baselines=baselines,
+        )
+        current_zone = _normalize_zone_name(getattr(env, "current_rx_zone", eval_zone_name))
+
+        episode_raw_reward = 0.0
+        episode_shaped_reward = 0.0
+        for _ in range(max_steps):
+            env_action, _, _ = sample_action_for_env(
+                agent,
+                state,
+                warmup=False,
+                global_step=0,
+                train_cfg=train_cfg,
+                deterministic=True,
+            )
+            next_state, raw_reward = env.step(env_action)
+            shaped_reward, _ = shape_reward(
+                float(raw_reward),
+                baselines=episode_baselines,
+                train_cfg=train_cfg,
+                current_zone=current_zone,
+            )
+            state = next_state
+            episode_raw_reward += float(raw_reward)
+            episode_shaped_reward += float(shaped_reward)
+
+        episode_avg_reward = episode_raw_reward / max(max_steps, 1)
+        episode_avg_shaped_reward = episode_shaped_reward / max(max_steps, 1)
+        raw_episode_rewards.append(episode_avg_reward)
+        shaped_episode_rewards.append(episode_avg_shaped_reward)
+
+        baseline_reference = _resolve_reward_baseline(episode_baselines, train_cfg)
+        if baseline_reference is not None:
+            reward_margins.append(episode_avg_reward - baseline_reference)
+
+    return {
+        "avg_reward": _safe_mean(raw_episode_rewards),
+        "avg_shaped_reward": _safe_mean(shaped_episode_rewards),
+        "avg_reward_margin": _safe_mean(reward_margins),
+    }
+
+
 def run_deterministic_eval(
     *,
     env,
@@ -608,56 +920,53 @@ def run_deterministic_eval(
     baselines: dict[str, float | None],
 ) -> dict[str, float]:
     eval_num_episodes = max(1, int(train_cfg.get("eval_num_episodes", 1)))
-    max_steps = int(train_cfg["max_steps_per_episode"])
-    raw_episode_rewards: list[float] = []
-    shaped_episode_rewards: list[float] = []
-    reward_margins: list[float] = []
+    eval_zone_name = str(train_cfg.get("eval_zone_name", "all")).strip().lower()
 
     snapshot = _snapshot_env_state(env)
     try:
-        for _ in range(eval_num_episodes):
-            state = env.reset()
-            episode_baselines = maybe_evaluate_episode_baselines(
-                env,
-                train_cfg=train_cfg,
-                fallback_baselines=baselines,
+        global_eval = _run_eval_rollouts(
+            env=env,
+            agent=agent,
+            train_cfg=train_cfg,
+            baselines=baselines,
+            eval_zone_name=eval_zone_name,
+            num_episodes=eval_num_episodes,
+        )
+        result = {
+            "eval_avg_reward": global_eval["avg_reward"],
+            "eval_avg_shaped_reward": global_eval["avg_shaped_reward"],
+            "eval_avg_reward_margin": global_eval["avg_reward_margin"],
+        }
+        if bool(train_cfg.get("zone_aware_eval_enabled", False)):
+            zone_names = train_cfg.get("zone_aware_eval_zones", ["los", "nlos"])
+            zone_eval_num_episodes = train_cfg.get("zone_aware_eval_num_episodes", None)
+            zone_eval_num_episodes = (
+                eval_num_episodes
+                if zone_eval_num_episodes is None
+                else max(1, int(zone_eval_num_episodes))
             )
-            episode_raw_reward = 0.0
-            episode_shaped_reward = 0.0
-            for _ in range(max_steps):
-                env_action, _, _ = sample_action_for_env(
-                    agent,
-                    state,
-                    warmup=False,
-                    global_step=0,
+            for zone_name in zone_names:
+                normalized_zone = _normalize_zone_name(zone_name)
+                if normalized_zone is None:
+                    continue
+                zone_eval = _run_eval_rollouts(
+                    env=env,
+                    agent=agent,
                     train_cfg=train_cfg,
-                    deterministic=True,
+                    baselines=baselines,
+                    eval_zone_name=normalized_zone,
+                    num_episodes=zone_eval_num_episodes,
                 )
-                next_state, raw_reward = env.step(env_action)
-                shaped_reward, _ = shape_reward(
-                    float(raw_reward),
-                    baselines=episode_baselines,
-                    train_cfg=train_cfg,
-                )
-                state = next_state
-                episode_raw_reward += float(raw_reward)
-                episode_shaped_reward += float(shaped_reward)
-
-            episode_avg_reward = episode_raw_reward / max(max_steps, 1)
-            raw_episode_rewards.append(episode_avg_reward)
-            shaped_episode_rewards.append(episode_shaped_reward / max(max_steps, 1))
-
-            baseline_reference = _resolve_reward_baseline(episode_baselines, train_cfg)
-            if baseline_reference is not None:
-                reward_margins.append(episode_avg_reward - baseline_reference)
+                result[f"eval_{normalized_zone}_avg_reward"] = zone_eval["avg_reward"]
+                result[f"eval_{normalized_zone}_avg_shaped_reward"] = zone_eval[
+                    "avg_shaped_reward"
+                ]
+                result[f"eval_{normalized_zone}_avg_reward_margin"] = zone_eval[
+                    "avg_reward_margin"
+                ]
+        return result
     finally:
         _restore_env_state(env, snapshot)
-
-    return {
-        "eval_avg_reward": float(np.mean(raw_episode_rewards)),
-        "eval_avg_shaped_reward": float(np.mean(shaped_episode_rewards)),
-        "eval_avg_reward_margin": _safe_mean(reward_margins),
-    }
 
 
 def append_metrics_jsonl(metrics_path: Path, payload: dict[str, Any]) -> None:
@@ -749,6 +1058,7 @@ def train(config_path: str | Path = "config.yaml") -> Path:
     logger.info("Using agent device=%s", agent.device)
 
     baselines = evaluate_baselines(env)
+    formal_baselines = collect_formal_baselines(env)
     logger.info(
         "Baselines | no_ris_rate=%.6f | phase_gradient_reflector_rate=%s",
         baselines["no_ris_rate"],
@@ -766,6 +1076,14 @@ def train(config_path: str | Path = "config.yaml") -> Path:
             "type": "baseline",
             "timestamp": datetime.now().isoformat(),
             **baselines,
+        },
+    )
+    append_metrics_jsonl(
+        metrics_path,
+        {
+            "type": "baseline_fixed_positions",
+            "timestamp": datetime.now().isoformat(),
+            **formal_baselines,
         },
     )
 
@@ -792,7 +1110,7 @@ def train(config_path: str | Path = "config.yaml") -> Path:
             total_episodes=total_episodes,
         )
         reuse_rx_position = episode > 1 and ((episode - 1) % rx_block_episodes != 0)
-        selected_rx_candidate_index, hard_rx_focus_prob, selected_rx_avg_gap = (
+        selected_rx_zone, selected_rx_candidate_index, hard_rx_focus_prob, selected_rx_avg_gap = (
             select_rx_candidate_index(
                 env,
                 train_cfg=train_cfg,
@@ -804,8 +1122,10 @@ def train(config_path: str | Path = "config.yaml") -> Path:
         state = env.reset(
             reuse_rx_position=reuse_rx_position,
             candidate_index=selected_rx_candidate_index,
+            zone_name=selected_rx_zone,
         )
         active_rx_candidate_index = getattr(env, "current_rx_candidate_index", None)
+        active_rx_zone = getattr(env, "current_rx_zone", None)
         episode_baselines = maybe_evaluate_episode_baselines(
             env,
             train_cfg=train_cfg,
@@ -852,6 +1172,7 @@ def train(config_path: str | Path = "config.yaml") -> Path:
                 float(raw_reward),
                 baselines=episode_baselines,
                 train_cfg=train_cfg,
+                current_zone=active_rx_zone,
             )
             hard_step_gap = 0.0 if reward_margin is None else max(-float(reward_margin), 0.0)
             episode_hard_gap_sum += hard_step_gap
@@ -946,6 +1267,7 @@ def train(config_path: str | Path = "config.yaml") -> Path:
         episode_hard_gap = None if episode_margin is None else max(-episode_margin, 0.0)
         update_hard_rx_stats(
             hard_rx_stats,
+            zone_name=active_rx_zone,
             candidate_index=active_rx_candidate_index,
             episode_gap=episode_hard_gap,
         )
@@ -1038,12 +1360,18 @@ def train(config_path: str | Path = "config.yaml") -> Path:
             ),
             "episode_reward_baseline": episode_baseline_reference,
             "rx_candidate_index": active_rx_candidate_index,
+            "rx_zone": active_rx_zone,
             "rx_focus_selected": float(selected_rx_candidate_index is not None),
+            "rx_focus_zone": selected_rx_zone,
             "rx_focus_selection_prob": hard_rx_focus_prob,
             "rx_focus_candidate_avg_gap": selected_rx_avg_gap,
             "rx_candidate_avg_gap_after_episode": None
-            if active_rx_candidate_index is None
-            else float(hard_rx_stats[active_rx_candidate_index]["avg_gap"]),
+            if active_rx_candidate_index is None or _normalize_zone_name(active_rx_zone) is None
+            else float(
+                hard_rx_stats[
+                    make_hard_rx_key(_normalize_zone_name(active_rx_zone), active_rx_candidate_index)
+                ]["avg_gap"]
+            ),
             "avg_actor_loss": _safe_mean(loss_accumulator["actor_loss"]),
             "avg_critic_loss": _safe_mean(loss_accumulator["critic_loss"]),
             "avg_alpha_loss": _safe_mean(loss_accumulator["alpha_loss"]),
@@ -1070,10 +1398,11 @@ def train(config_path: str | Path = "config.yaml") -> Path:
         }
 
         logger.info(
-            "Episode %03d | avg_reward=%.6f | avg_shaped_reward=%.6f | rx_idx=%s | rx_gap=%s | det_frac=%s | actor_upd=%s | critic_loss=%s | eval_reward=%s",
+            "Episode %03d | avg_reward=%.6f | avg_shaped_reward=%.6f | rx_zone=%s | rx_idx=%s | rx_gap=%s | det_frac=%s | actor_upd=%s | critic_loss=%s | eval_reward=%s",
             summary["episode"],
             summary["avg_reward"],
             summary["avg_shaped_reward"],
+            summary.get("rx_zone", "n/a"),
             "n/a" if summary["rx_candidate_index"] is None else int(summary["rx_candidate_index"]),
             _fmt_float(summary["rx_candidate_avg_gap_after_episode"]),
             _fmt_float(summary["avg_collection_deterministic"]),
@@ -1276,6 +1605,18 @@ def _safe_mean(values: list[float]) -> float | None:
     if not values:
         return None
     return float(np.mean(values))
+
+
+def _maybe_float_value(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(value):
+        return None
+    return value
 
 
 def _fmt_float(value: float | None) -> str:

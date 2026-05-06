@@ -319,6 +319,146 @@ def plot_learning_curve(
     }
 
 
+def plot_academic_learning_curve(
+    run_path: str | Path,
+    *,
+    smoothing_window: int = 10,
+    primary_key: str = "avg_reward",
+    include_eval: bool = True,
+    figure_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Plot a publication-style learning curve with exact no-RIS and reflector baselines."""
+    metrics_path, csv_path = _resolve_training_artifacts(run_path)
+    baseline_metrics, episode_metrics = _load_training_metrics(metrics_path, csv_path)
+
+    valid_primary_keys = {
+        "avg_reward",
+        "avg_shaped_reward",
+        "eval_avg_reward",
+        "eval_avg_shaped_reward",
+    }
+    if primary_key not in valid_primary_keys:
+        raise ValueError(f"`primary_key` must be one of {sorted(valid_primary_keys)}.")
+
+    episodes = np.asarray([row["episode"] for row in episode_metrics], dtype=np.int32)
+    primary_values = np.asarray(
+        [_maybe_float(row.get(primary_key)) for row in episode_metrics],
+        dtype=np.float64,
+    )
+    if episodes.size == 0 or not np.isfinite(primary_values).any():
+        raise RuntimeError("No valid reward metrics were found in the training artifacts.")
+
+    window = max(1, min(int(smoothing_window), primary_values.size))
+    smoothed_primary = _moving_average(primary_values, window=window)
+
+    no_ris_baseline = baseline_metrics.get("fixed_position_no_ris_rate")
+    if no_ris_baseline is None:
+        no_ris_baseline = baseline_metrics.get("no_ris_rate")
+
+    reflector_baseline = baseline_metrics.get("fixed_position_phase_gradient_reflector_rate")
+    if reflector_baseline is None:
+        reflector_baseline = baseline_metrics.get("phase_gradient_reflector_rate")
+
+    fig, ax = plt.subplots(figsize=(11, 6.5), constrained_layout=True)
+    sns.lineplot(
+        x=episodes,
+        y=smoothed_primary,
+        ax=ax,
+        label=f"SAC {primary_key} (smoothed, window={window})",
+        color="#1d4ed8",
+        linewidth=2.8,
+    )
+
+    raw_rewards = np.asarray(
+        [_maybe_float(row.get("avg_reward")) for row in episode_metrics],
+        dtype=np.float64,
+    )
+    if np.isfinite(raw_rewards).any():
+        sns.lineplot(
+            x=episodes,
+            y=raw_rewards,
+            ax=ax,
+            label="Episode reward",
+            color="#93c5fd",
+            linewidth=1.2,
+            alpha=0.45,
+        )
+
+    if include_eval:
+        eval_rewards = np.asarray(
+            [_maybe_float(row.get("eval_avg_reward")) for row in episode_metrics],
+            dtype=np.float64,
+        )
+        if np.isfinite(eval_rewards).any():
+            sns.lineplot(
+                x=episodes,
+                y=eval_rewards,
+                ax=ax,
+                label="Deterministic eval reward",
+                color="#059669",
+                linewidth=2.0,
+                linestyle="-.",
+            )
+
+    if no_ris_baseline is not None:
+        ax.axhline(
+            float(no_ris_baseline),
+            color="#7c3aed",
+            linestyle="--",
+            linewidth=2.0,
+            label="No RIS baseline",
+        )
+    if reflector_baseline is not None:
+        ax.axhline(
+            float(reflector_baseline),
+            color="#111827",
+            linestyle="--",
+            linewidth=2.0,
+            label="Phase-gradient reflector baseline",
+        )
+
+    best_smoothed_reward = float(np.nanmax(smoothed_primary))
+    improvement_over_reflector = None
+    if reflector_baseline is not None:
+        improvement_over_reflector = 100.0 * (
+            best_smoothed_reward - float(reflector_baseline)
+        ) / max(abs(float(reflector_baseline)), EPS)
+        relation = "above" if improvement_over_reflector >= 0.0 else "below"
+        ax.annotate(
+            (
+                f"Best smoothed SAC reward is "
+                f"{abs(improvement_over_reflector):.2f}% {relation} reflector"
+            ),
+            xy=(int(episodes[-1]), best_smoothed_reward),
+            xytext=(0.46, 0.14),
+            textcoords="axes fraction",
+            bbox={"boxstyle": "round,pad=0.35", "fc": "white", "ec": "#1f2937", "alpha": 0.9},
+            arrowprops={"arrowstyle": "->", "color": "#1f2937", "lw": 1.5},
+        )
+
+    ax.set_title("Academic RIS Learning Curve with Exact Baselines")
+    ax.set_xlabel("Episode")
+    ax.set_ylabel("Average rate / reward [bit/s/Hz]")
+    ax.legend(loc="best")
+    sns.despine(fig=fig)
+
+    if figure_path is not None:
+        fig.savefig(Path(figure_path), dpi=300, bbox_inches="tight")
+
+    return {
+        "figure": fig,
+        "ax": ax,
+        "episodes": episodes,
+        "smoothed_rewards": smoothed_primary,
+        "best_smoothed_reward": best_smoothed_reward,
+        "no_ris_baseline": no_ris_baseline,
+        "reflector_baseline": reflector_baseline,
+        "improvement_over_reflector_percent": improvement_over_reflector,
+        "metrics_path": metrics_path,
+        "csv_path": csv_path,
+    }
+
+
 def plot_phase_profile(
     phase_profile: np.ndarray,
     *,
@@ -612,6 +752,8 @@ def _load_training_metrics(
     baseline_metrics: dict[str, float | None] = {
         "no_ris_rate": None,
         "phase_gradient_reflector_rate": None,
+        "fixed_position_no_ris_rate": None,
+        "fixed_position_phase_gradient_reflector_rate": None,
     }
     episode_metrics: list[dict[str, Any]] = []
 
@@ -626,6 +768,14 @@ def _load_training_metrics(
                     baseline_metrics["no_ris_rate"] = _maybe_float(payload.get("no_ris_rate"))
                     baseline_metrics["phase_gradient_reflector_rate"] = _maybe_float(
                         payload.get("phase_gradient_reflector_rate")
+                    )
+                elif payload.get("type") == "baseline_fixed_positions":
+                    overall = payload.get("overall", {}) or {}
+                    baseline_metrics["fixed_position_no_ris_rate"] = _maybe_float(
+                        overall.get("no_ris_rate_mean")
+                    )
+                    baseline_metrics["fixed_position_phase_gradient_reflector_rate"] = (
+                        _maybe_float(overall.get("phase_gradient_reflector_rate_mean"))
                     )
                 elif payload.get("type") == "episode":
                     episode_metrics.append(
@@ -724,6 +874,7 @@ def _maybe_float(value: Any) -> float | None:
 
 __all__ = [
     "plot_coverage_comparison",
+    "plot_academic_learning_curve",
     "plot_learning_curve",
     "plot_phase_profile",
 ]

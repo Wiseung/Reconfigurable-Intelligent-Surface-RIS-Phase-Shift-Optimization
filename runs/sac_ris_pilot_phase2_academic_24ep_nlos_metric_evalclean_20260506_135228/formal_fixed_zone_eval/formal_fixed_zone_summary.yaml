@@ -1,0 +1,61 @@
+run_dir: /home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_phase2_academic_24ep_nlos_metric_evalclean_20260506_135228
+config_path: /home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_phase2_academic_24ep_nlos_metric_evalclean_20260506_135228/resolved_config.yaml
+checkpoint_path: /home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_phase2_academic_24ep_nlos_metric_evalclean_20260506_135228/recommended_agent.pt
+output_dir: /home/developer716/workspace/Reconfigurable-Intelligent-Surface-RIS-Phase-Shift-Optimization/runs/sac_ris_pilot_phase2_academic_24ep_nlos_metric_evalclean_20260506_135228/formal_fixed_zone_eval
+num_candidates: 8
+num_rollouts_per_candidate: 4
+evaluation_mode: deterministic_actor_fixed_los_nlos_zone_set
+rx_jitter_xy_m: 0.0
+representative_zone: nlos
+representative_candidate_index: 2
+representative_rx_position:
+- -46.0
+- 86.0
+- 1.5
+no_ris_rate_mean_over_candidates: 14.239606933844925
+no_ris_rate_std_over_candidates: 3.355586312776734
+phase_gradient_reflector_rate_mean_over_candidates: 14.94516860159491
+phase_gradient_reflector_rate_std_over_candidates: 2.687390258520602
+drl_avg_rate_mean_over_candidates: 14.245065947196043
+drl_avg_rate_std_over_candidates: 3.3504762355020183
+drl_final_rate_mean_over_candidates: 14.245065947196043
+drl_final_rate_std_over_candidates: 3.3504762355020183
+drl_best_rate_mean_over_candidates: 14.245065947196043
+drl_best_rate_std_over_candidates: 3.3504762355020183
+drl_avg_minus_reflector_mean_over_candidates: -0.7001026543988669
+drl_avg_minus_reflector_std_over_candidates: 1.0981646308070967
+drl_final_minus_reflector_mean_over_candidates: -0.7001026543988669
+drl_final_minus_reflector_std_over_candidates: 1.0981646308070967
+drl_avg_minus_no_ris_mean_over_candidates: 0.005459013351116759
+drl_avg_minus_no_ris_std_over_candidates: 0.024160892794892197
+drl_final_minus_no_ris_mean_over_candidates: 0.005459013351116759
+drl_final_minus_no_ris_std_over_candidates: 0.024160892794892197
+candidate_mean_avg_beats_reflector_rate: 0.25
+candidate_mean_final_beats_reflector_rate: 0.25
+rollout_avg_beats_reflector_rate: 0.25
+rollout_final_beats_reflector_rate: 0.25
+zone_summaries:
+- zone_name: los
+  num_candidates: 4
+  no_ris_rate_mean: 17.556659856240394
+  phase_gradient_reflector_rate_mean: 17.50148948492347
+  drl_avg_rate_mean: 17.557398027712516
+  drl_final_rate_mean: 17.557398027712516
+  avg_minus_reflector_mean: 0.05590854278904622
+  final_minus_reflector_mean: 0.05590854278904622
+  avg_beats_reflector_rate: 0.25
+  final_beats_reflector_rate: 0.25
+  avg_gain_over_reflector_pct_mean: 0.3194501978657772
+  final_gain_over_reflector_pct_mean: 0.3194501978657772
+- zone_name: nlos
+  num_candidates: 4
+  no_ris_rate_mean: 10.922554011449456
+  phase_gradient_reflector_rate_mean: 12.388847718266348
+  drl_avg_rate_mean: 10.932733866679568
+  drl_final_rate_mean: 10.932733866679568
+  avg_minus_reflector_mean: -1.45611385158678
+  final_minus_reflector_mean: -1.45611385158678
+  avg_beats_reflector_rate: 0.25
+  final_beats_reflector_rate: 0.25
+  avg_gain_over_reflector_pct_mean: -11.75342440798476
+  final_gain_over_reflector_pct_mean: -11.75342440798476

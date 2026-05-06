@@ -15,6 +15,9 @@ import os
 from typing import Any, Iterable
 
 DEFAULT_TF_DEVICE = "cpu"
+ZONE_LOS = "los"
+ZONE_NLOS = "nlos"
+ZONE_ALL = "all"
 
 _MODULE_TF_DEVICE = os.environ.get("SIONNA_TF_DEVICE", DEFAULT_TF_DEVICE).strip().lower()
 if _MODULE_TF_DEVICE == "cpu":
@@ -138,6 +141,20 @@ class SionnaRISEnv:
         coverage_num_samples: int = DEFAULT_COVERAGE_NUM_SAMPLES,
         probe_num_samples: int = DEFAULT_PROBE_NUM_SAMPLES,
         state_num_paths: int = STATE_NUM_PATHS,
+        discrete_phase: bool = False,
+        num_bits: int = 2,
+        mobility_enabled: bool = False,
+        zone_spawn_mode: str = ZONE_ALL,
+        zone_los_search_center: Iterable[float] | None = None,
+        zone_los_search_size: Iterable[float] | None = None,
+        zone_los_cell_size: Iterable[float] | None = None,
+        zone_los_min_direct_gain: float = 1e-10,
+        zone_nlos_search_center: Iterable[float] | None = None,
+        zone_nlos_search_size: Iterable[float] | None = None,
+        zone_nlos_cell_size: Iterable[float] | None = None,
+        zone_nlos_max_direct_gain: float = 1e-12,
+        zone_num_candidates_per_zone: int = 8,
+        zone_sampling_weights: dict[str, float] | None = None,
     ) -> None:
         self.tf_device = str(tf_device).strip().lower()
         self.tf_memory_limit_mb = int(tf_memory_limit_mb)
@@ -160,6 +177,14 @@ class SionnaRISEnv:
         self.probe_num_samples = int(probe_num_samples)
         self.num_samples = self.coverage_num_samples
         self.state_num_paths = int(state_num_paths)
+        self.discrete_phase = bool(discrete_phase)
+        self.num_bits = int(num_bits)
+        self.mobility_enabled = bool(mobility_enabled)
+        self.zone_spawn_mode = str(zone_spawn_mode).strip().lower()
+        if self.zone_spawn_mode not in {ZONE_ALL, ZONE_LOS, ZONE_NLOS}:
+            raise ValueError(
+                "`zone_spawn_mode` must be one of {'all', 'los', 'nlos'}."
+            )
         self.ris_rows, self.ris_cols = RIS_SHAPE
         self.action_dim = self.ris_rows * self.ris_cols
         self.rng = np.random.default_rng(rng_seed)
@@ -172,6 +197,50 @@ class SionnaRISEnv:
             ris_search_lateral_offsets_m, dtype=np.float32
         )
         self.ris_search_heights_m = np.asarray(ris_search_heights_m, dtype=np.float32)
+        self.zone_num_candidates_per_zone = int(max(zone_num_candidates_per_zone, 1))
+        self.zone_los_search_center = np.asarray(
+            zone_los_search_center
+            if zone_los_search_center is not None
+            else np.array([-70.0, 45.0, self.rx_height_m], dtype=np.float32),
+            dtype=np.float32,
+        )
+        self.zone_los_search_size = np.asarray(
+            zone_los_search_size
+            if zone_los_search_size is not None
+            else np.array([80.0, 80.0], dtype=np.float32),
+            dtype=np.float32,
+        )
+        self.zone_los_cell_size = np.asarray(
+            zone_los_cell_size
+            if zone_los_cell_size is not None
+            else self.blind_spot_cell_size,
+            dtype=np.float32,
+        )
+        self.zone_los_min_direct_gain = float(max(zone_los_min_direct_gain, 0.0))
+        self.zone_nlos_search_center = np.asarray(
+            zone_nlos_search_center
+            if zone_nlos_search_center is not None
+            else self.blind_spot_search_center,
+            dtype=np.float32,
+        )
+        self.zone_nlos_search_size = np.asarray(
+            zone_nlos_search_size
+            if zone_nlos_search_size is not None
+            else self.blind_spot_search_size,
+            dtype=np.float32,
+        )
+        self.zone_nlos_cell_size = np.asarray(
+            zone_nlos_cell_size
+            if zone_nlos_cell_size is not None
+            else self.blind_spot_cell_size,
+            dtype=np.float32,
+        )
+        self.zone_nlos_max_direct_gain = float(max(zone_nlos_max_direct_gain, 0.0))
+        raw_zone_sampling_weights = dict(zone_sampling_weights or {})
+        self.zone_sampling_weights = {
+            ZONE_LOS: float(max(raw_zone_sampling_weights.get(ZONE_LOS, 1.0), 0.0)),
+            ZONE_NLOS: float(max(raw_zone_sampling_weights.get(ZONE_NLOS, 1.0), 0.0)),
+        }
 
         self.scene = rt.load_scene(rt.scene.etoile)
         self.scene.frequency = self.carrier_frequency_hz
@@ -208,6 +277,7 @@ class SionnaRISEnv:
             size=self.blind_spot_search_size,
             cell_size=self.blind_spot_cell_size,
         )
+        self._zone_candidates = self._build_zone_candidates()
         self._base_rx_position = self._blind_spot_candidates[0].copy()
 
         self.rx = rt.Receiver(
@@ -227,6 +297,7 @@ class SionnaRISEnv:
         )
 
         self.current_rx_candidate_index: int | None = 0
+        self.current_rx_zone: str = ZONE_NLOS
         self.last_state: np.ndarray | None = None
         self.last_reward: float | None = None
 
@@ -240,21 +311,31 @@ class SionnaRISEnv:
         """Return the number of blind-spot candidates available for reset control."""
         return int(len(self._blind_spot_candidates))
 
+    @property
+    def zone_candidates(self) -> dict[str, np.ndarray]:
+        """Return defensive copies of the LOS/NLOS candidate pools."""
+        return {
+            zone_name: np.array(candidates, dtype=np.float32, copy=True)
+            for zone_name, candidates in self._zone_candidates.items()
+        }
+
     def reset(
         self,
         reuse_rx_position: bool = False,
         candidate_index: int | None = None,
+        zone_name: str | None = None,
     ) -> np.ndarray:
         """Reset the RIS and optionally resample the blind-zone RX position."""
         if not reuse_rx_position:
+            selected_zone, available_candidates = self._resolve_reset_zone_and_candidates(zone_name)
             if candidate_index is None:
-                candidate_index = int(self.rng.integers(0, len(self._blind_spot_candidates)))
-            if candidate_index < 0 or candidate_index >= len(self._blind_spot_candidates):
+                candidate_index = int(self.rng.integers(0, len(available_candidates)))
+            if candidate_index < 0 or candidate_index >= len(available_candidates):
                 raise ValueError(
-                    f"`candidate_index` must be in [0, {len(self._blind_spot_candidates) - 1}], "
+                    f"`candidate_index` must be in [0, {len(available_candidates) - 1}], "
                     f"received {candidate_index}."
                 )
-            base = self._blind_spot_candidates[int(candidate_index)].copy()
+            base = available_candidates[int(candidate_index)].copy()
             jitter = self.rng.uniform(
                 low=[-self.rx_jitter_xy_m, -self.rx_jitter_xy_m, 0.0],
                 high=[self.rx_jitter_xy_m, self.rx_jitter_xy_m, 0.0],
@@ -263,6 +344,7 @@ class SionnaRISEnv:
             position[2] = self.rx_height_m
             self.rx.position = position.tolist()
             self.current_rx_candidate_index = int(candidate_index)
+            self.current_rx_zone = str(selected_zone)
         else:
             position = np.array(self.rx.position, dtype=np.float32, copy=True)
             position[2] = self.rx_height_m
@@ -273,6 +355,45 @@ class SionnaRISEnv:
 
         self.last_state = self._compute_state()
         return self.last_state
+
+    def _resolve_reset_zone_and_candidates(
+        self,
+        zone_name: str | None,
+    ) -> tuple[str, np.ndarray]:
+        requested_zone = self.zone_spawn_mode if zone_name is None else str(zone_name).strip().lower()
+        if requested_zone == ZONE_ALL:
+            if self.mobility_enabled:
+                candidate_zones = [
+                    zone
+                    for zone in (ZONE_LOS, ZONE_NLOS)
+                    if len(self._zone_candidates.get(zone, ())) > 0
+                ]
+                if not candidate_zones:
+                    return ZONE_NLOS, self._blind_spot_candidates
+                weights = np.asarray(
+                    [float(self.zone_sampling_weights.get(zone, 1.0)) for zone in candidate_zones],
+                    dtype=np.float64,
+                )
+                if not np.any(np.isfinite(weights)) or float(np.sum(weights)) <= 0.0:
+                    chosen_zone = str(self.rng.choice(candidate_zones))
+                else:
+                    weights = np.where(np.isfinite(weights), weights, 0.0)
+                    weights = weights / float(np.sum(weights))
+                    chosen_zone = str(self.rng.choice(candidate_zones, p=weights))
+                return chosen_zone, self._zone_candidates[chosen_zone]
+            return ZONE_NLOS, self._blind_spot_candidates
+
+        if requested_zone not in {ZONE_LOS, ZONE_NLOS}:
+            raise ValueError("`zone_name` must be one of {'los', 'nlos', 'all'}.")
+
+        zone_candidates = self._zone_candidates.get(requested_zone)
+        if zone_candidates is None or len(zone_candidates) == 0:
+            if requested_zone == ZONE_NLOS:
+                return ZONE_NLOS, self._blind_spot_candidates
+            if len(self._blind_spot_candidates) > 0:
+                return ZONE_NLOS, self._blind_spot_candidates
+            raise RuntimeError(f"No candidates are available for zone `{requested_zone}`.")
+        return requested_zone, zone_candidates
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float]:
         """Apply a RIS phase profile and return `(next_state, reward)`."""
@@ -410,6 +531,87 @@ class SionnaRISEnv:
         fallback_candidates[:, 2] = self.rx_height_m
         return fallback_candidates.astype(np.float32)
 
+    def _build_zone_candidates(self) -> dict[str, np.ndarray]:
+        """Create fixed LOS and NLOS candidate pools for mobility experiments."""
+        los_candidates = self._find_zone_candidates(
+            center=self.zone_los_search_center,
+            size=self.zone_los_search_size,
+            cell_size=self.zone_los_cell_size,
+            zone_name=ZONE_LOS,
+            max_candidates=self.zone_num_candidates_per_zone,
+        )
+        nlos_candidates = self._find_zone_candidates(
+            center=self.zone_nlos_search_center,
+            size=self.zone_nlos_search_size,
+            cell_size=self.zone_nlos_cell_size,
+            zone_name=ZONE_NLOS,
+            max_candidates=self.zone_num_candidates_per_zone,
+        )
+        if nlos_candidates.size == 0:
+            nlos_candidates = np.array(self._blind_spot_candidates, dtype=np.float32, copy=True)
+        return {
+            ZONE_LOS: los_candidates,
+            ZONE_NLOS: nlos_candidates,
+        }
+
+    def _find_zone_candidates(
+        self,
+        *,
+        center: np.ndarray,
+        size: np.ndarray,
+        cell_size: np.ndarray,
+        zone_name: str,
+        max_candidates: int,
+    ) -> np.ndarray:
+        """Select candidate positions that match LOS or deep-NLOS criteria."""
+        coverage_map = self.compute_coverage_map(
+            include_ris=False,
+            center=center,
+            size=size,
+            cell_size=cell_size,
+        )
+
+        path_gain = coverage_map.path_gain
+        cell_centers = coverage_map.cell_centers
+        if hasattr(path_gain, "numpy"):
+            path_gain = path_gain.numpy()
+        if hasattr(cell_centers, "numpy"):
+            cell_centers = cell_centers.numpy()
+
+        path_gain = np.asarray(path_gain, dtype=np.float64)
+        cell_centers = np.asarray(cell_centers, dtype=np.float32)
+        if path_gain.ndim == 3:
+            path_gain = path_gain[0]
+
+        valid_positions: list[tuple[float, np.ndarray]] = []
+        for cell_index in np.argwhere(np.isfinite(path_gain)):
+            x_idx, y_idx = int(cell_index[0]), int(cell_index[1])
+            candidate = cell_centers[x_idx, y_idx].copy()
+            candidate[2] = self.rx_height_m
+            total_gain = float(path_gain[x_idx, y_idx])
+            if total_gain <= 0.0:
+                continue
+            direct_gain = self._estimate_direct_path_gain_at_position(candidate)
+            if zone_name == ZONE_LOS:
+                if direct_gain < self.zone_los_min_direct_gain:
+                    continue
+                score = -direct_gain
+            else:
+                if direct_gain > self.zone_nlos_max_direct_gain:
+                    continue
+                estimated_rate = self._estimate_no_ris_rate_at_position(candidate)
+                if not np.isfinite(estimated_rate) or estimated_rate <= 0.0:
+                    continue
+                score = estimated_rate
+            valid_positions.append((score, candidate))
+
+        if not valid_positions:
+            return np.empty((0, 3), dtype=np.float32)
+
+        valid_positions.sort(key=lambda item: item[0])
+        selected = [candidate for _, candidate in valid_positions[: int(max_candidates)]]
+        return np.asarray(selected, dtype=np.float32)
+
     def _refine_blind_spot_candidates(self, candidates: np.ndarray) -> np.ndarray:
         """Keep the weakest candidates that still have a non-zero pointwise rate."""
         scored_candidates: list[tuple[float, np.ndarray]] = []
@@ -443,6 +645,44 @@ class SionnaRISEnv:
             return self._rate_from_paths(paths, include_ris=False)
         finally:
             self.scene.remove("blind_probe_rx")
+
+    def _estimate_direct_path_gain_at_position(self, position: np.ndarray) -> float:
+        """Estimate the direct-path gain at a candidate position."""
+        probe_rx = rt.Receiver(name="direct_probe_rx", position=np.asarray(position).tolist())
+        self.scene.add(probe_rx)
+        try:
+            paths = self.scene.compute_paths(
+                max_depth=0,
+                num_samples=self.probe_num_samples,
+                los=True,
+                reflection=False,
+                diffraction=False,
+                scattering=False,
+                ris=False,
+                edge_diffraction=False,
+            )
+            coefficients, delays = paths.cir(
+                los=True,
+                reflection=False,
+                diffraction=False,
+                scattering=False,
+                ris=False,
+                num_paths=None,
+            )
+            coeff_np = np.asarray(coefficients.numpy(), dtype=np.complex64).reshape(-1)
+            delay_np = np.asarray(delays.numpy(), dtype=np.float32).reshape(-1)
+            valid = (
+                np.isfinite(coeff_np.real)
+                & np.isfinite(coeff_np.imag)
+                & np.isfinite(delay_np)
+                & (delay_np >= 0.0)
+            )
+            if not np.any(valid):
+                return 0.0
+            effective = np.sum(coeff_np[valid], dtype=np.complex64)
+            return float(np.abs(effective) ** 2)
+        finally:
+            self.scene.remove("direct_probe_rx")
 
     def _suggest_ris_position(self) -> np.ndarray:
         """Select a static RIS position from a stable geometry heuristic."""
@@ -593,8 +833,34 @@ class SionnaRISEnv:
                 f"{self.ris_rows}x{self.ris_cols} RIS, but got {action.size}."
             )
 
-        phase_values = action.reshape(1, self.ris_rows, self.ris_cols)
+        phase_values = action.reshape(self.ris_rows, self.ris_cols)
+        if self.discrete_phase:
+            phase_values = self._quantize_phase_matrix(phase_values)
+        phase_values = phase_values.reshape(1, self.ris_rows, self.ris_cols)
         self._assign_phase_values(self.ris, phase_values)
+
+    def _quantize_phase_matrix(self, phase_values: np.ndarray) -> np.ndarray:
+        """Map continuous physical phases to the nearest hardware-supported states."""
+        phase_values = np.asarray(phase_values, dtype=np.float32)
+        if self.num_bits <= 0:
+            raise ValueError("`num_bits` must be positive when `discrete_phase=True`.")
+
+        num_levels = 2 ** self.num_bits
+        if num_levels <= 1:
+            return np.zeros_like(phase_values, dtype=np.float32)
+
+        wrapped = np.mod(phase_values, 2.0 * np.pi)
+        discrete_levels = np.linspace(
+            0.0,
+            2.0 * np.pi,
+            num=num_levels,
+            endpoint=False,
+            dtype=np.float32,
+        )
+        step = (2.0 * np.pi) / float(num_levels)
+        indices = np.floor((wrapped + 0.5 * step) / step).astype(np.int64) % num_levels
+        quantized = discrete_levels[indices]
+        return quantized.astype(np.float32)
 
     def _assign_phase_gradient_reflector(self) -> bool:
         """Configure the native Sionna RIS baseline if available."""

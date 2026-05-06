@@ -56,6 +56,16 @@ class SACConfig:
     replay_priority_alpha: float = 1.0
     replay_uniform_ratio: float = 0.0
     replay_priority_epsilon: float = 1e-3
+    use_cnn_feature_extractor: bool = False
+    state_channels: int = 2
+    state_antennas: int = 1
+    state_delay_taps: int | None = None
+    state_feature_dim: int = 256
+    cnn_conv1_channels: int = 32
+    cnn_conv2_channels: int = 64
+    cnn_kernel_size_1: int = 5
+    cnn_kernel_size_2: int = 3
+    cnn_pool_size: int = 2
     target_entropy: float | None = None
     target_entropy_scale: float | None = 1.0
     alpha_min: float | None = None
@@ -280,19 +290,193 @@ class GroupedRISMapper:
         return phase_grid
 
 
-class GaussianActor(nn.Module):
-    """SAC actor with LayerNorm on the state input."""
+class ChannelFeatureExtractor(nn.Module):
+    """Compress a structured CIR tensor into a compact latent state vector.
 
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 512) -> None:
+    The input contract is `[batch, real_imag_channels, antennas, delay_taps]`.
+    For replay and NumPy bridge compatibility, callers may still pass a flat
+    `[batch, state_dim]` tensor. The extractor reshapes it internally.
+    """
+
+    def __init__(
+        self,
+        *,
+        state_dim: int,
+        state_channels: int = 2,
+        state_antennas: int = 1,
+        state_delay_taps: int | None = None,
+        output_dim: int = 256,
+        conv1_channels: int = 32,
+        conv2_channels: int = 64,
+        kernel_size_1: int = 5,
+        kernel_size_2: int = 3,
+        pool_size: int = 2,
+    ) -> None:
         super().__init__()
-        self.state_norm = nn.LayerNorm(state_dim)
-        self.fc1 = nn.Linear(state_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.mean_head = nn.Linear(hidden_dim, action_dim)
-        self.log_std_head = nn.Linear(hidden_dim, action_dim)
+        self.state_dim = int(state_dim)
+        self.state_channels = int(state_channels)
+        self.state_antennas = int(state_antennas)
+        self.state_delay_taps = self._resolve_delay_taps(state_delay_taps)
+        self.output_dim = int(output_dim)
+        self.pool_size = int(pool_size)
+
+        kernel_size_1 = int(max(kernel_size_1, 1))
+        kernel_size_2 = int(max(kernel_size_2, 1))
+        padding_1 = kernel_size_1 // 2
+        padding_2 = kernel_size_2 // 2
+
+        self.conv1 = nn.Conv2d(
+            in_channels=self.state_channels,
+            out_channels=int(conv1_channels),
+            kernel_size=(1, kernel_size_1),
+            padding=(0, padding_1),
+        )
+        self.conv2 = nn.Conv2d(
+            in_channels=int(conv1_channels),
+            out_channels=int(conv2_channels),
+            kernel_size=(1, kernel_size_2),
+            padding=(0, padding_2),
+        )
+        self.pool = nn.MaxPool2d(
+            kernel_size=(1, self.pool_size),
+            stride=(1, self.pool_size),
+        )
+
+        with torch.no_grad():
+            dummy = torch.zeros(
+                1,
+                self.state_channels,
+                self.state_antennas,
+                self.state_delay_taps,
+                dtype=torch.float32,
+            )
+            flattened_dim = int(self._forward_conv(dummy).reshape(1, -1).shape[-1])
+        self.projection = nn.Linear(flattened_dim, self.output_dim)
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        x = self._reshape_state(state)
+        x = self._forward_conv(x)
+        x = torch.flatten(x, start_dim=1)
+        return self.projection(x)
+
+    def _forward_conv(self, state: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.conv1(state))
+        x = self.pool(x)
+        x = F.relu(self.conv2(x))
+        x = self.pool(x)
+        return x
+
+    def _reshape_state(self, state: torch.Tensor) -> torch.Tensor:
+        if state.ndim == 1:
+            state = state.unsqueeze(0)
+        if state.ndim == 2:
+            if state.shape[-1] != self.state_dim:
+                raise ValueError(
+                    f"Expected flattened state dim {self.state_dim}, "
+                    f"received {state.shape[-1]}."
+                )
+            return state.reshape(
+                state.shape[0],
+                self.state_channels,
+                self.state_antennas,
+                self.state_delay_taps,
+            )
+        if state.ndim == 4:
+            expected_shape = (
+                self.state_channels,
+                self.state_antennas,
+                self.state_delay_taps,
+            )
+            if tuple(state.shape[-3:]) != expected_shape:
+                raise ValueError(
+                    "Structured CIR state shape mismatch. Expected trailing "
+                    f"shape {expected_shape}, received {tuple(state.shape[-3:])}."
+                )
+            return state
+        raise ValueError(
+            "ChannelFeatureExtractor expects a flattened [batch, state_dim] or "
+            "structured [batch, channels, antennas, delay_taps] tensor."
+        )
+
+    def _resolve_delay_taps(self, state_delay_taps: int | None) -> int:
+        base = self.state_channels * self.state_antennas
+        if base <= 0:
+            raise ValueError("`state_channels` and `state_antennas` must be positive.")
+        if state_delay_taps is None:
+            if self.state_dim % base != 0:
+                raise ValueError(
+                    f"state_dim={self.state_dim} is not divisible by "
+                    f"state_channels*state_antennas={base}."
+                )
+            delay_taps = self.state_dim // base
+        else:
+            delay_taps = int(state_delay_taps)
+        if delay_taps <= 0:
+            raise ValueError("`state_delay_taps` must be positive.")
+        expected_dim = base * delay_taps
+        if expected_dim != self.state_dim:
+            raise ValueError(
+                f"Expected state_dim={expected_dim} from channels={self.state_channels}, "
+                f"antennas={self.state_antennas}, delay_taps={delay_taps}, "
+                f"but got state_dim={self.state_dim}."
+            )
+        return delay_taps
+
+
+class StateEncoder(nn.Module):
+    """Encode either flat legacy states or structured CIR states for SAC."""
+
+    def __init__(self, config: SACConfig) -> None:
+        super().__init__()
+        self.use_cnn_feature_extractor = bool(config.use_cnn_feature_extractor)
+        self.state_dim = int(config.state_dim)
+        if self.use_cnn_feature_extractor:
+            self.feature_extractor = ChannelFeatureExtractor(
+                state_dim=config.state_dim,
+                state_channels=config.state_channels,
+                state_antennas=config.state_antennas,
+                state_delay_taps=config.state_delay_taps,
+                output_dim=config.state_feature_dim,
+                conv1_channels=config.cnn_conv1_channels,
+                conv2_channels=config.cnn_conv2_channels,
+                kernel_size_1=config.cnn_kernel_size_1,
+                kernel_size_2=config.cnn_kernel_size_2,
+                pool_size=config.cnn_pool_size,
+            )
+            self.output_dim = int(config.state_feature_dim)
+        else:
+            self.feature_extractor = None
+            self.output_dim = self.state_dim
+        self.output_norm = nn.LayerNorm(self.output_dim)
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        if self.feature_extractor is None:
+            if state.ndim == 1:
+                state = state.unsqueeze(0)
+            x = state.reshape(state.shape[0], -1)
+            if x.shape[-1] != self.state_dim:
+                raise ValueError(
+                    f"Expected flattened state dim {self.state_dim}, "
+                    f"received {x.shape[-1]}."
+                )
+        else:
+            x = self.feature_extractor(state)
+        return self.output_norm(x)
+
+
+class GaussianActor(nn.Module):
+    """SAC actor with optional CNN CIR compression and LayerNorm."""
+
+    def __init__(self, config: SACConfig) -> None:
+        super().__init__()
+        self.state_encoder = StateEncoder(config)
+        self.fc1 = nn.Linear(self.state_encoder.output_dim, config.hidden_dim)
+        self.fc2 = nn.Linear(config.hidden_dim, config.hidden_dim)
+        self.mean_head = nn.Linear(config.hidden_dim, config.grouped_action_dim)
+        self.log_std_head = nn.Linear(config.hidden_dim, config.grouped_action_dim)
 
     def forward(self, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        x = self.state_norm(state)
+        x = self.state_encoder(state)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         mean = self.mean_head(x)
@@ -318,18 +502,21 @@ class GaussianActor(nn.Module):
 
 
 class QNetwork(nn.Module):
-    """Single critic network with LayerNorm on the state branch."""
+    """Single critic network with optional CNN CIR compression."""
 
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 512) -> None:
+    def __init__(self, config: SACConfig) -> None:
         super().__init__()
-        self.state_norm = nn.LayerNorm(state_dim)
-        self.fc1 = nn.Linear(state_dim + action_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, 1)
+        self.state_encoder = StateEncoder(config)
+        self.fc1 = nn.Linear(
+            self.state_encoder.output_dim + config.grouped_action_dim,
+            config.hidden_dim,
+        )
+        self.fc2 = nn.Linear(config.hidden_dim, config.hidden_dim)
+        self.fc3 = nn.Linear(config.hidden_dim, 1)
 
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        normalized_state = self.state_norm(state)
-        x = torch.cat([normalized_state, action], dim=-1)
+        encoded_state = self.state_encoder(state)
+        x = torch.cat([encoded_state, action], dim=-1)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         return self.fc3(x)
@@ -338,10 +525,10 @@ class QNetwork(nn.Module):
 class TwinCritic(nn.Module):
     """Twin critics used by SAC."""
 
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 512) -> None:
+    def __init__(self, config: SACConfig) -> None:
         super().__init__()
-        self.q1 = QNetwork(state_dim, action_dim, hidden_dim)
-        self.q2 = QNetwork(state_dim, action_dim, hidden_dim)
+        self.q1 = QNetwork(config)
+        self.q2 = QNetwork(config)
 
     def forward(
         self,
@@ -368,21 +555,9 @@ class SACAgent:
             physical_cols=config.physical_cols,
         )
 
-        self.actor = GaussianActor(
-            state_dim=config.state_dim,
-            action_dim=config.grouped_action_dim,
-            hidden_dim=config.hidden_dim,
-        ).to(self.device)
-        self.critic = TwinCritic(
-            state_dim=config.state_dim,
-            action_dim=config.grouped_action_dim,
-            hidden_dim=config.hidden_dim,
-        ).to(self.device)
-        self.critic_target = TwinCritic(
-            state_dim=config.state_dim,
-            action_dim=config.grouped_action_dim,
-            hidden_dim=config.hidden_dim,
-        ).to(self.device)
+        self.actor = GaussianActor(config).to(self.device)
+        self.critic = TwinCritic(config).to(self.device)
+        self.critic_target = TwinCritic(config).to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
         for parameter in self.critic_target.parameters():
             parameter.requires_grad = False
@@ -685,9 +860,16 @@ class SACAgent:
     def load(self, path: str, strict: bool = True) -> None:
         """Load a saved SAC state."""
         payload: dict[str, Any] = torch.load(path, map_location=self.device)
-        self.actor.load_state_dict(payload["actor"], strict=strict)
-        self.critic.load_state_dict(payload["critic"], strict=strict)
-        self.critic_target.load_state_dict(payload["critic_target"], strict=strict)
+        try:
+            self.actor.load_state_dict(payload["actor"], strict=strict)
+            self.critic.load_state_dict(payload["critic"], strict=strict)
+            self.critic_target.load_state_dict(payload["critic_target"], strict=strict)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Checkpoint architecture is incompatible with the current SACAgent "
+                "configuration. This can happen when enabling the CNN CIR feature "
+                "extractor or changing the grouped/physical state contract."
+            ) from exc
         self.actor_optimizer.load_state_dict(payload["actor_optimizer"])
         self.critic_optimizer.load_state_dict(payload["critic_optimizer"])
         self.log_alpha.data.copy_(payload["log_alpha"].to(self.device))

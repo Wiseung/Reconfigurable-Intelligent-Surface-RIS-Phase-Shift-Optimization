@@ -1,0 +1,3 @@
+zone_name,num_candidates,no_ris_rate_mean,phase_gradient_reflector_rate_mean,drl_avg_rate_mean,drl_final_rate_mean,avg_minus_reflector_mean,final_minus_reflector_mean,avg_beats_reflector_rate,final_beats_reflector_rate,avg_gain_over_reflector_pct_mean,final_gain_over_reflector_pct_mean
+los,4,17.556659856240394,17.50148948492347,17.557116814982567,17.557116814982567,0.0556273300590977,0.0556273300590977,0.25,0.25,0.317843404740022,0.317843404740022
+nlos,4,10.922554011449456,12.388847718266348,10.923043786779122,10.923043786779122,-1.4658039314872284,-1.4658039314872284,0.25,0.25,-11.831640559484962,-11.831640559484962

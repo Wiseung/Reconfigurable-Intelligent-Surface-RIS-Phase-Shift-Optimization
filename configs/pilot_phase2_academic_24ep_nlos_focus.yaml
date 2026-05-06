@@ -1,0 +1,120 @@
+seed: 7
+
+env:
+  tx_boresight_target: [0.0, 90.0, 1.5]
+  tf_device: cpu
+  tf_memory_limit_mb: 14336
+  max_depth: 2
+  path_num_samples: 5000
+  coverage_num_samples: 12000
+  probe_num_samples: 64
+  state_num_paths: 64
+  rx_height_m: 1.5
+  rx_jitter_xy_m: 0.5
+  blind_spot_search_center: [-10.0, 90.0, 1.5]
+  blind_spot_search_size: [80.0, 80.0]
+  blind_spot_cell_size: [8.0, 8.0]
+  num_blind_spot_candidates: 8
+  ris_position: [-180.0, 100.0, 20.0]
+  require_native_ris: true
+  discrete_phase: true
+  num_bits: 2
+  mobility_enabled: true
+  zone_spawn_mode: all
+  zone_sampling_weights:
+    los: 1.0
+    nlos: 3.0
+  zone_los_search_center: [-110.0, 30.0, 1.5]
+  zone_los_search_size: [96.0, 96.0]
+  zone_los_cell_size: [16.0, 16.0]
+  zone_los_min_direct_gain: 1.0e-12
+  zone_nlos_search_center: [-10.0, 90.0, 1.5]
+  zone_nlos_search_size: [80.0, 80.0]
+  zone_nlos_cell_size: [8.0, 8.0]
+  zone_nlos_max_direct_gain: 1.0e-12
+  zone_num_candidates_per_zone: 4
+
+agent:
+  grouped_rows: 10
+  grouped_cols: 10
+  physical_rows: 100
+  physical_cols: 100
+  hidden_dim: 512
+  batch_size: 64
+  replay_capacity: 10000
+  dual_replay: true
+  hard_replay_capacity: 4000
+  hard_replay_ratio: 0.125
+  prioritized_replay: false
+  replay_priority_alpha: 1.0
+  replay_uniform_ratio: 0.0
+  replay_priority_epsilon: 0.001
+  actor_lr: 0.0003
+  critic_lr: 0.0003
+  alpha_lr: 0.0003
+  init_alpha: 0.05
+  target_entropy_scale: 0.20
+  alpha_min: 0.01
+  alpha_max: 0.08
+  use_cnn_feature_extractor: true
+  state_channels: 2
+  state_antennas: 1
+  state_delay_taps: 64
+  state_feature_dim: 256
+  cnn_conv1_channels: 16
+  cnn_conv2_channels: 32
+  cnn_kernel_size_1: 5
+  cnn_kernel_size_2: 3
+  cnn_pool_size: 2
+  device:
+
+train:
+  num_episodes: 24
+  max_steps_per_episode: 8
+  warmup_steps: 64
+  warmup_action_scale: 0.16
+  policy_exploration_scale_start: 0.16
+  policy_exploration_scale_end: 0.03
+  policy_additive_noise_std_start: 0.008
+  policy_additive_noise_std_end: 0.0
+  policy_noise_decay_steps: 256
+  collection_deterministic_prob_start: 0.00
+  collection_deterministic_prob_end: 0.85
+  collection_deterministic_prob_decay_steps: 256
+  collection_deterministic_noise_std: 0.0
+  policy_delay: 2
+  hard_actor_update_gap_threshold: 3.0
+  hard_actor_policy_delay: 6
+  hard_actor_min_observations: 2
+  rx_block_episodes: 2
+  updates_per_step: 1
+  checkpoint_every: 6
+  deterministic_eval: true
+  eval_every_episodes: 2
+  eval_num_episodes: 2
+  save_best_eval_checkpoint: true
+  best_eval_metric: eval_avg_reward
+  final_checkpoint_reeval_enabled: true
+  final_checkpoint_reeval_num_episodes: 4
+  final_checkpoint_reeval_last_k_checkpoints: 3
+  final_checkpoint_reeval_include_best_eval: true
+  final_checkpoint_reeval_include_final: true
+  final_checkpoint_reeval_metric: eval_avg_reward
+  reward_margin_weight: 0.45
+  reward_margin_positive_weight: 0.15
+  reward_margin_negative_weight: 0.85
+  reward_baseline_key: phase_gradient_reflector_rate
+  hard_replay_route_mode: exclusive
+  hard_replay_step_gap_threshold: 2.0
+  hard_replay_block_gap_threshold: 2.5
+  hard_step_priority_scale: 0.25
+  hard_block_priority_scale: 0.10
+  hard_priority_max: 8.0
+
+logging:
+  output_dir: runs
+  experiment_name: sac_ris_pilot_phase2_academic_24ep_nlos_focus
+  log_file: training.log
+  metrics_file: metrics.jsonl
+  csv_file: episode_metrics.csv
+  save_final_checkpoint: true
